@@ -66,7 +66,7 @@ test('displayName prefers a custom title and calls default Hermes', () => {
 test('previewLine falls back when the bot has no last message', () => {
   const { previewLine } = loadHelpers()
 
-  assert.equal(previewLine({}), 'Waiting for a task')
+  assert.equal(previewLine({}), '等待任务')
   assert.ok(previewLine({ last_session: { preview: 'Hello there' } }).includes('Hello'))
 })
 
@@ -135,7 +135,7 @@ test('roamMs is longer for a farther walk, and stays in range', () => {
 })
 
 test('plugin id matches the folder contract', () => {
-  assert.match(source, /const ID = 'hermes-office'/)
+  assert.match(source, /const ID = 'amm-opc-office'/)
   assert.match(source, /id: ID/)
   assert.match(source, /path: '\/office'/)
 })
@@ -247,9 +247,9 @@ test('pizza wiring: rounds start on tasks, claims happen at the carpet office co
   assert.match(source, /\$pizza\.set\(freshPizza\(Date\.now\(\)\)\)/)
   assert.doesNotMatch(source, /\$backdrop\.get\(\) === 'pizza'/)
   assert.match(source, /claimPizza\(\$pizza\.get\(\), name, now\)/)
-  assert.match(source, /children: 'Pizza break'/)
-  assert.match(source, /if \(pizza\) \{\s*return 'pizza!'/)
-  assert.match(source, /if \(noPizza\) \{\s*return 'no pizza'/)
+  assert.match(source, /children: '披萨时间'/)
+  assert.match(source, /if \(pizza\) \{\s*return '披萨！'/)
+  assert.match(source, /if \(noPizza\) \{\s*return '没披萨'/)
 })
 
 test('idleBotNames leaves thinking bots at their desks', () => {
@@ -401,7 +401,7 @@ test('bored bots, weekly counters, and the recap line', () => {
   assert.equal(w.tasks, 1)
   assert.equal(w.pizzas.scout, 2)
   assert.equal(w.hops, 1)
-  assert.equal(weekLine(w), 'This week: 1 task, scout ate 2 pizzas, 1 hop')
+  assert.equal(weekLine(w), '本周：1 个任务，scout 吃了 2 块披萨，1 次跳')
   assert.equal(weekLine(null), null)
 
   const nextWeek = weekBump(w, 'tasks', 'scout', wed.getTime() + 7 * day)
@@ -550,7 +550,7 @@ test('keyboard, drag, responsive, recovery, and reduced-motion contracts are har
   assert.match(source, /@media \(max-width: 600px\)/)
   assert.match(source, /@media \(max-width: 360px\)/)
   assert.match(source, /pluginCtx\?\.os\?\.writeClipboard/)
-  assert.match(source, /children: 'dismiss'/)
+  assert.match(source, /children: '忽略'/)
   const rm = source.slice(source.indexOf('@media (prefers-reduced-motion: reduce)'))
   assert.match(rm, /\.office-confetti \{ display:none !important; \}/)
 })
@@ -563,12 +563,12 @@ test('header names and quiet labels', () => {
   assert.equal(headerLine(['Scout', 'Arke', 'Hermes', 'Nyx'], 'thinking', 'thinking'), 'Scout, Arke +2 thinking')
   assert.equal(headerLine([], 'x', 'y'), '')
 
-  assert.equal(quietStatus('here'), true)
-  assert.equal(quietStatus('at desk'), true)
-  assert.equal(quietStatus('exploring'), true)
-  assert.equal(quietStatus('thinking'), false)
-  assert.equal(quietStatus('bored'), false)
-  assert.equal(quietStatus('pizza!'), false)
+  assert.equal(quietStatus('在岗'), true)
+  assert.equal(quietStatus('在工位'), true)
+  assert.equal(quietStatus('溜达'), true)
+  assert.equal(quietStatus('思考中'), false)
+  assert.equal(quietStatus('无聊'), false)
+  assert.equal(quietStatus('披萨！'), false)
 })
 
 test('employee of the month: most tasks wins, ties keep the holder, new month resets', () => {

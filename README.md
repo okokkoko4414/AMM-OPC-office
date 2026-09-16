@@ -1,4 +1,4 @@
-# Hermes Office
+# AMM OPC Office
 
 A small, increasingly peculiar office for your Hermes bots. One carpeted room, real tasks, a pizza counter, and a cat with no respect for the seating plan.
 
@@ -57,10 +57,10 @@ Reduced-motion settings disable decorative bouncing, spinning, and incident anim
 Copy this folder to the machine running Hermes Desktop:
 
 ```text
-%USERPROFILE%\AppData\Local\hermes\desktop-plugins\hermes-office
+%USERPROFILE%\AppData\Local\hermes\desktop-plugins\amm-opc-office
 ```
 
-The folder must be named `hermes-office`. Press Ctrl+K, then **Reload desktop plugins**. Open **Office** in the sidebar or use **Open office floor** in the command palette.
+The folder must be named `amm-opc-office`. Press Ctrl+K, then **Reload desktop plugins**. Open **AMM OPC Office** in the sidebar or use **打开办公室楼层** in the command palette.
 
 Use a Desktop build with owner-routed `host.requestProfile`, `host.onEvent`, and `host.openSession`. Office fails closed when it cannot establish who owns a background request. Bot Mode does not need to be on, but its saved names and avatars are reused.
 
@@ -96,7 +96,7 @@ Catalog admission is pending. The repository does not imply approval or endorsem
 To install the package directly before catalog admission:
 
 ```sh
-hermes plugins install Adolanium/hermes-office/catalog
+hermes plugins install okokkoko4414/AMM-OPC-office/catalog
 ```
 
 Restart Hermes Desktop or rescan plugins, then enable the Desktop component in
@@ -109,7 +109,7 @@ installation per Desktop plugin. Before switching from a manual install, back up
 and move its folder out of the Desktop plugin directory; Hermes intentionally
 does not overwrite manual installations. Keep plugin settings when migrating.
 
-After catalog admission, use `hermes plugins update hermes-office` and rescan
+After catalog admission, use `hermes plugins update amm-opc-office` and rescan
 Desktop plugins to adopt a reviewed update. The packaged copy's update and restore
 actions cannot replace its files from GitHub releases. Standalone signed updates
 continue to use the existing root files.

@@ -23,7 +23,7 @@ import {
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const ID = 'hermes-office'
+const ID = 'amm-opc-office'
 const ROSTER_KEY = [ID, 'roster']
 const META_NS = 'hermes-bots'
 const DRAG_PX = 8
@@ -61,7 +61,7 @@ let openSequence = 0
 const RITUAL_MS = 2800
 const RITUAL_WINDOW_MS = 10 * 60 * 1000
 const $petPing = atom({})
-const OFFICE_NS = 'hermes-office'
+const OFFICE_NS = 'amm-opc-office'
 const BORED_MS = 2 * 24 * 60 * 60 * 1000
 let puffSeq = 0
 
@@ -173,12 +173,12 @@ function celebrate(name, route = null) {
 
   patchFx(name, { doneRound: round, clapUntil: now + 1100, confettiUntil: now + 950, bangUntil: now + 1500, nap: false, goBar: true, goHome: false })
   const quirk = officeQuirk(name)
-  officeSay(name, quirk.id === 'champion' ? 'Another historic delivery!' : quirk.id === 'quiet' ? 'Your parcel is ready.' : quirk.line)
+  officeSay(name, quirk.id === 'champion' ? '又一次载入史册的交付！' : quirk.id === 'quiet' ? '你的包裹好了。' : quirk.line)
   if (quirk.id === 'quiet') patchFx(name, { clapUntil: 0, confettiUntil: 0 })
   addTrophy(name, route)
   bumpWeek('tasks', name)
   bumpMonth(name)
-  rememberOffice('work', `${displayName({ name }, {})} delivered a result.`, [name])
+  rememberOffice('work', `${displayName({ name }, {})} 交付了成果。`, [name])
   leaveNote(name, now)
   advanceHint('play')
 }
@@ -510,7 +510,7 @@ function headerLine(names, one, many) {
 
 // Steady state labels fade after a moment so a full floor stays calm.
 function quietStatus(text) {
-  return text === 'here' || text === 'at desk' || text === 'exploring'
+  return text === '在岗' || text === '在工位' || text === '溜达'
 }
 
 // Which round a completion belongs to, or null if that round already
@@ -544,10 +544,10 @@ function taskTransition(job, event) {
     return { ...job, state: JOB_STATES.COMPLETED, completedAt: event.at || Date.now(), error: null }
   }
   if (event.type === 'failed') {
-    return { ...job, state: JOB_STATES.FAILED, completedAt: event.at || Date.now(), error: String(event.error || 'The task failed.') }
+    return { ...job, state: JOB_STATES.FAILED, completedAt: event.at || Date.now(), error: String(event.error || '任务失败了。') }
   }
   if (event.type === 'unknown') {
-    return { ...job, state: JOB_STATES.UNKNOWN, error: String(event.error || 'The task status could not be confirmed.') }
+    return { ...job, state: JOB_STATES.UNKNOWN, error: String(event.error || '无法确认任务状态。') }
   }
   return job
 }
@@ -668,20 +668,20 @@ function weekLine(stats) {
 
   const bits = []
   if (stats.tasks) {
-    bits.push(`${stats.tasks} task${stats.tasks === 1 ? '' : 's'}`)
+    bits.push(`${stats.tasks} 个任务`)
   }
 
   const eaters = Object.entries(stats.pizzas || {}).sort((a, b) => b[1] - a[1])
   if (eaters.length) {
     const [who, n] = eaters[0]
-    bits.push(`${who === 'default' ? 'Hermes' : who} ate ${n} pizza${n === 1 ? '' : 's'}`)
+    bits.push(`${who === 'default' ? 'Hermes' : who} 吃了 ${n} 块披萨`)
   }
 
   if (stats.hops) {
-    bits.push(`${stats.hops} hop${stats.hops === 1 ? '' : 's'}`)
+    bits.push(`${stats.hops} 次跳`)
   }
 
-  return `This week: ${bits.join(', ')}`
+  return `本周：${bits.join('，')}`
 }
 
 function clockLabel(date = new Date()) {
@@ -840,7 +840,7 @@ function outputText(bot) {
 function previewLine(bot) {
   const text = outputText(bot)
   if (!text) {
-    return 'Waiting for a task'
+    return '等待任务'
   }
   return text.length > 72 ? `${text.slice(0, 71)}…` : text
 }
@@ -1423,7 +1423,7 @@ async function ensureBotChat(bot) {
       })
     } catch (error) {
       // Never interpret an unavailable registry as an absent Bot Chat.
-      throw new Error(`Could not check ${name}'s Bot Chat registry: ${String(error?.message || error)}`)
+      throw new Error(`无法检查 ${name} 的 Bot 聊天注册表：${String(error?.message || error)}`)
     }
 
     const rows = Array.isArray(listed?.sessions) ? listed.sessions : []
@@ -1526,7 +1526,7 @@ function handleJobEvent(event) {
     } else if (event.type === 'message.complete') {
       const failure = event.payload?.status === 'error'
       if (failure) {
-        updateJob(name, row.id, { type: 'failed', error: event.payload?.error || 'The task failed.' })
+        updateJob(name, row.id, { type: 'failed', error: event.payload?.error || '任务失败了。' })
         const poll = jobPollers.get(name)
         if (poll?.id === row.id) {
           clearInterval(poll.timer)
@@ -1544,7 +1544,7 @@ function watchJob(name, id) {
     if (!row) return
     const age = Date.now() - (row.submittedAt || Date.now())
     if (age > 10 * 60 * 1000) {
-      updateJob(name, id, { type: 'unknown', error: 'The task is still unresolved after ten minutes.' })
+      updateJob(name, id, { type: 'unknown', error: '任务十分钟后仍未解决。' })
       clearInterval(timer)
       jobPollers.delete(name)
       return
@@ -1583,14 +1583,14 @@ async function openBot(bot) {
     return await withBotLease(bot, async route => {
       const chat = await ensureBotChat(bot)
       const id = chat?.stored
-      if (!id || typeof host.openSession !== 'function') throw new Error('This Hermes Desktop cannot open stored Bot Chats')
+      if (!id || typeof host.openSession !== 'function') throw new Error('此桌面端无法打开已存储的 Bot 聊天')
       if (openId !== openSequence) return false
       await host.openSession(id, { profile: bot.name, ...(route ? { route } : {}) })
       if (openId === openSequence) readNote(bot.name)
       return true
     })
   } catch (error) {
-    try { host.notifyError(error, `Could not open ${botLook(bot).title}'s Bot Chat`) } catch { /* older shell */ }
+    try { host.notifyError(error, `无法打开 ${botLook(bot).title} 的 Bot 聊天`) } catch { /* older shell */ }
     return false
   }
 }
@@ -1600,14 +1600,14 @@ async function sendTask(bot, text) {
   if (!task || !jobAllowsSubmission(currentJob(bot.name))) return false
   return withBotLease(bot, async route => {
     const chat = await ensureBotChat(bot)
-    if (!chat?.runtime) throw new Error('Could not open that bot chat')
+    if (!chat?.runtime) throw new Error('无法打开该机器人的聊天')
     const row = markJob(bot, chat, task, route)
     try {
       await requestForBot(bot, 'prompt.submit', { session_id: chat.runtime, text: task })
       updateJob(bot.name, row.id, { type: 'accepted' })
       startRound(bot.name, row.id)
     } catch (error) {
-      updateJob(bot.name, row.id, { type: 'failed', error: error?.message || 'Could not send the task.' })
+      updateJob(bot.name, row.id, { type: 'failed', error: error?.message || '无法发送任务。' })
       patchFx(bot.name, { goHome: false })
       throw error
     }
@@ -1910,7 +1910,7 @@ function finishWalk(name, walk) {
       $pizza.set(pizza)
       if (won && pizza.winner === name && !(pizza.counted || {})[name]) {
         bumpWeek('pizza', name)
-        rememberOffice('pizza', `${displayName({ name }, {})} claimed the first slice.`, [name])
+        rememberOffice('pizza', `${displayName({ name }, {})} 抢到了第一块披萨。`, [name])
         pizza.counted = { ...(pizza.counted || {}), [name]: true }
       }
       patchFx(name, won ? { pizzaUntil: now + PIZZA_MS, lingerUntil: now + 6000 } : { noPizzaUntil: now + 4200 })
@@ -2346,105 +2346,105 @@ function WorkerFace({ color, image, mood, size = 36, name, sad = false }) {
 }
 
 function statusText({ face, isActive, wander, cheers, gamePhase, leftover, pizza, noPizza, walkKind, five, yawn, ritual, taskState }) {
-  if (taskState === 'failed') return 'failed'
-  if (taskState === 'unknown') return 'status?'
+  if (taskState === 'failed') return '失败'
+  if (taskState === 'unknown') return '状态？'
   if (face === 'sleep') {
-    return 'zzz'
+    return '呼…'
   }
 
   if (face === 'held') {
-    return 'ah!'
+    return '啊！'
   }
 
   if (face === 'pet') {
-    return 'hee'
+    return '嘿嘿'
   }
 
   if (pizza) {
-    return 'pizza!'
+    return '披萨！'
   }
 
   if (noPizza) {
-    return 'no pizza'
+    return '没披萨'
   }
 
   if (five) {
-    return 'high five!'
+    return '击掌！'
   }
 
   if (yawn && face !== 'sleep') {
-    return 'yawn'
+    return '哈欠'
   }
 
   if (ritual && face !== 'sleep' && face !== 'think') {
-    return 'break'
+    return '休息'
   }
 
   if (cheers) {
-    return 'cheers'
+    return '干杯'
   }
 
   if (face === 'clap') {
-    return 'yay'
+    return '耶！'
   }
 
   if (leftover) {
-    return 'doh'
+    return '哎呀'
   }
 
   if (gamePhase === 'scramble') {
-    return 'go'
+    return '跑！'
   }
 
   if (gamePhase === 'freeze') {
-    return '!'
+    return '！'
   }
 
   if (gamePhase === 'sit') {
-    return 'sit'
+    return '坐下'
   }
 
   if (face === 'stretch') {
-    return 'hup'
+    return '嘿咻'
   }
 
   if (face === 'shy') {
-    return 'eep'
+    return '呀'
   }
 
   if (face === 'peek') {
-    return 'boo?'
+    return '咘？'
   }
 
   if (face === 'think') {
-    return 'thinking'
+    return '思考中'
   }
 
   if (face === 'bored') {
-    return 'bored'
+    return '无聊'
   }
 
   if (walkKind === 'hopscotch') {
-    return 'hop hop'
+    return '跳跳'
   }
 
   if (walkKind === 'bar') {
-    return 'to the bar'
+    return '去吧台'
   }
 
   if (walkKind === 'home') {
-    return 'heading back'
+    return '回座位'
   }
 
   if (walkKind === 'chair') {
-    return 'mine!'
+    return '我的！'
   }
 
   if (wander) {
-    return 'exploring'
+    return '溜达'
   }
 
-  return isActive ? 'here' : 'at desk'
+  return isActive ? '在岗' : '在工位'
 }
 
 function PizzaSlice({ className }) {
@@ -2469,14 +2469,14 @@ function Person({ bot, look, face, wander, closer, whisper, hi, ask, bang, five,
   const needsInput = Boolean(useValue($officeInput)[bot.name])
   const quirk = officeQuirk(bot.name, life)
   const chatter = useValue($officeChatter)[bot.name]
-  const status = needsInput ? 'needs input' : statusText({ face, isActive: onPetStart.isActive, wander, cheers, gamePhase, leftover, pizza, noPizza, walkKind, five, yawn, ritual, taskState })
+  const status = needsInput ? '待输入' : statusText({ face, isActive: onPetStart.isActive, wander, cheers, gamePhase, leftover, pizza, noPizza, walkKind, five, yawn, ritual, taskState })
   return jsxs('div', {
     className: cn('office-person', `quirk-${quirk.id}`, `is-${face}`, needsInput && 'is-waiting', wander && 'is-wander', closer && 'is-closer', cheers && 'is-cheers', pizza && 'has-pizza', drop && 'is-drop', ritual && 'is-lookup'),
     style,
     role: 'button',
     tabIndex: 0,
-    'aria-label': `Pet ${look.title}`,
-    title: `${look.title}. Hover to startle, tap to pet, hold to send to sleep, drag to move.`,
+    'aria-label': `抚摸 ${look.title}`,
+    title: `${look.title}。悬停吓一跳，点击抚摸，长按哄睡，拖动移动。`,
     onPointerEnter: onPetStart.onEnter,
     onPointerLeave: onPetStart.onLeave,
     onPointerDown: onPetStart.onDown,
@@ -2493,7 +2493,7 @@ function Person({ bot, look, face, wander, closer, whisper, hi, ask, bang, five,
         ? jsxs('div', { className: 'office-hearts', 'aria-hidden': true, children: [jsx('span', { children: '♥' }), jsx('span', { children: '♥' }), jsx('span', { children: '♥' })] })
         : null,
       whisper || hi || ask || bang
-        ? jsx('div', { className: cn('office-whisper', (hi || ask || bang) && 'is-hi'), children: hi ? 'hi!' : ask ? '?' : bang ? '!' : '\u2026' })
+        ? jsx('div', { className: cn('office-whisper', (hi || ask || bang) && 'is-hi'), children: hi ? '嗨！' : ask ? '？' : bang ? '！' : '\u2026' })
         : null,
       chatter && chatter.until > Date.now() && face !== 'think' ? jsx('span', { className: 'office-banter', children: chatter.text }) : null,
       wander ? jsx('span', { className: 'office-ground', 'aria-hidden': true }) : null,
@@ -2690,7 +2690,7 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
             ? jsx('button', {
                 type: 'button',
                 className: 'office-memo',
-                title: `${look.title} has news. Open the chat.`,
+                title: `${look.title} 有新消息。打开聊天。`,
                 onClick: event => {
                   event.stopPropagation()
                   void onOpen()
@@ -2752,25 +2752,25 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
           event.stopPropagation()
           void onOpen()
         },
-        title: `Give ${look.title} a task. Double-click to open their chat.`,
+        title: `给 ${look.title} 派个任务。双击打开其聊天。`,
         children: [
           jsx('div', { className: 'office-name', children: look.title }),
           jsxs('div', {
             className: 'office-handle',
             children: [
               `@${handle}`,
-              trophies[bot.name] ? jsx('span', { className: 'office-stars', title: `${trophies[bot.name]} tasks done`, children: `\u2605 ${trophies[bot.name]}` }) : null
+              trophies[bot.name] ? jsx('span', { className: 'office-stars', title: `${trophies[bot.name]} 个任务完成`, children: `\u2605 ${trophies[bot.name]}` }) : null
             ]
           })
         ]
       }),
-      needsInput ? jsx('button', { type: 'button', className: 'office-input-request', onClick: onOpen, children: 'Raised hand · open question' }) : null,
+      needsInput ? jsx('button', { type: 'button', className: 'office-input-request', onClick: onOpen, children: '举手 · 待答复问题' }) : null,
       output
         ? jsx('button', {
             type: 'button',
             className: 'office-say',
             onClick: onOpen,
-            title: `Open ${look.title}'s chat`,
+            title: `打开 ${look.title} 的聊天`,
             children: output
           })
         : null,
@@ -2779,7 +2779,7 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
             type: 'button',
             className: 'office-home',
             onClick: onOpen,
-            children: 'open chat'
+            children: '打开聊天'
           })
         : null,
       seat
@@ -2787,7 +2787,7 @@ function Desk({ bot, isActive, turnBusy, tasked, taskState, picked, roomRef, nig
             type: 'button',
             className: 'office-home',
             onClick: () => startWalkHome(bot.name, roomRef.current),
-            children: 'back to desk'
+            children: '回工位'
           })
         : null
     ]
@@ -2805,7 +2805,7 @@ function Doodle() {
 }
 
 function Monitor({ on, text, since, now, boot, doodle }) {
-  const copy = on ? typedText(text || '> working on it', since ? Math.max(0, (now || 0) - since) : 1e9) : text
+  const copy = on ? typedText(text || '> 工作中', since ? Math.max(0, (now || 0) - since) : 1e9) : text
 
   return jsxs('div', {
     className: 'office-monitor',
@@ -3132,7 +3132,7 @@ function Hopscotch({ onHop, now }) {
   return jsxs('div', {
     className: 'office-aisle',
     children: [
-      jsx('div', { className: 'office-hop-label', children: 'hop' }),
+      jsx('div', { className: 'office-hop-label', children: '跳' }),
       ...HOP_ROWS.map(row =>
         jsx(
           'div',
@@ -3145,8 +3145,8 @@ function Hopscotch({ onHop, now }) {
                   type: 'button',
                   className: cn('office-hop', lit.has(String(n)) && 'is-lit'),
                   'data-hop': String(n),
-                  'aria-label': `Hopscotch square ${n}`,
-                  title: 'Tap to send an idle bot down the hopscotch',
+                  'aria-label': `跳房子第 ${n} 格`,
+                  title: '点击让空闲机器人跳房子',
                   onPointerDown: event => {
                     event.stopPropagation()
                     onHop?.()
@@ -3211,8 +3211,8 @@ function OfficeBar({ count, now }) {
   return jsxs('aside', {
     className: 'office-bar',
     children: [
-      jsx('div', { className: 'office-bar-sign', children: 'Pizza break' }),
-      ding ? jsx('div', { className: 'office-ding office-chip', children: 'ding!' }) : null,
+      jsx('div', { className: 'office-bar-sign', children: '披萨时间' }),
+      ding ? jsx('div', { className: 'office-ding office-chip', children: '叮！' }) : null,
       jsx('div', { className: 'office-bar-shelf', 'aria-hidden': true, children: null }),
       jsx('div', {
         className: 'office-bar-counter',
@@ -3238,12 +3238,12 @@ function FloorTools({ roster, jobs, activeProfile, turnBusy, roomRef, idleCount 
       jsx('button', {
         type: 'button',
         className: cn('office-tool', game && 'is-on'),
-        title: game ? 'Stop musical chairs' : 'Play musical chairs',
+        title: game ? '停止抢椅子' : '玩抢椅子',
         disabled: !game && idleCount < 2,
         onClick: () => {
           startMusicalChairs(roster, jobs, activeProfile, turnBusy, roomRef.current)
         },
-        children: game ? 'stop' : 'chairs'
+        children: game ? '停' : '椅子'
       })
     ]
   })
@@ -3293,10 +3293,10 @@ function EmployeeOfMonth({ roster }) {
 
   return jsxs('div', {
     className: 'office-eom',
-    title: `Employee of the month: ${look.title}, ${n} task${n === 1 ? '' : 's'} in ${month}`,
+    title: `本月最佳员工：${look.title}，${month} ${n} 个任务`,
     children: [
       jsx('div', { className: 'office-eom-frame', children: jsx(WorkerFace, { color: look.color, image: look.image, mood: 'idle', size: 30, name: bot.name }) }),
-      jsx('div', { className: 'office-eom-plate', children: 'employee of the month' }),
+      jsx('div', { className: 'office-eom-plate', children: '本月最佳员工' }),
       jsx('div', { className: 'office-eom-name', children: look.title })
     ]
   }, holder)
@@ -3304,7 +3304,7 @@ function EmployeeOfMonth({ roster }) {
 
 // "3 tasks done overall" plus who did what, for the tally board tooltip.
 function tallyTitle(tally, trophies, roster) {
-  const head = `${tally} task${tally === 1 ? '' : 's'} done overall`
+  const head = `${tally} 个任务总计完成`
   const rows = (roster || [])
     .map(bot => [botLook(bot).title, (trophies || {})[bot.name] || 0])
     .filter(([, n]) => n > 0)
@@ -3316,7 +3316,7 @@ function tallyTitle(tally, trophies, roster) {
 function Ambience({ backdrop, tally, sky, roster, trophies }) {
   const bits = [jsx(EmployeeOfMonth, { roster: roster || [] }, 'eom')]
   if (sky) bits.push(jsx(WallWindow, { sky }, 'window'))
-  if (tally > 0) bits.push(jsx('div', { className: 'office-tally office-chip', title: tallyTitle(tally, trophies, roster), children: `${tally} done` }, 'tally'))
+  if (tally > 0) bits.push(jsx('div', { className: 'office-tally office-chip', title: tallyTitle(tally, trophies, roster), children: `${tally} 完成` }, 'tally'))
   if (backdrop === 'carpet') {
     bits.push(jsxs('svg', { className: 'office-cooler', viewBox: '0 0 22 52', width: 22, height: 52, children: [
       jsx('rect', { x: 4, y: 20, width: 14, height: 30, rx: 2, fill: '#e9ecf0' }),
@@ -3334,17 +3334,17 @@ function Ambience({ backdrop, tally, sky, roster, trophies }) {
 
 function HintBubble({ roster, stage, onClose, selectedName }) {
   const target = roster.find(row => row.name === selectedName) || roster[0]
-  const first = target ? botLook(target).title : 'a bot'
+  const first = target ? botLook(target).title : '一个机器人'
   const copy = stage === 'task'
-    ? [jsx('b', { children: `Give ${first} something small.` }, 'b'), ' Type it in the bar below and press Send. Watch the desk.']
-    : [jsx('b', { children: `${first} is back. Try petting them.` }, 'b'), ' Hover to startle, tap to pet, hold to send to sleep, drag to move. Then tap a hop square or press chairs.']
+    ? [jsx('b', { children: `给 ${first} 派个小任务。` }, 'b'), ' 在下方输入框输入并点击发送。观察它的工位。']
+    : [jsx('b', { children: `${first} 回来了。试着摸摸它。` }, 'b'), ' 悬停吓一跳，点击抚摸，长按哄睡，拖动移动。然后点跳房子格或按椅子。']
 
   return jsxs('div', {
     className: cn('office-hint', stage === 'task' && 'is-task'),
     role: 'note',
     children: [
       jsx('div', { className: 'office-hint-copy', children: copy }),
-      jsx('button', { type: 'button', className: 'office-hint-close', 'aria-label': 'Dismiss', onClick: onClose, children: '\u00d7' })
+      jsx('button', { type: 'button', className: 'office-hint-close', 'aria-label': '关闭', onClick: onClose, children: '\u00d7' })
     ]
   })
 }
@@ -3471,7 +3471,7 @@ function OfficeProps({ now, roomRef, onReplay }) {
         type: 'button',
         className: cn('office-clock', clockKind === 'digital' && 'is-digital', clockPos && 'is-free'),
         style: clockPos ? { left: clockPos.x, top: clockPos.y } : undefined,
-        title: clockKind === 'digital' ? 'Drag to move. Click for analog.' : 'Drag to move. Click for digital.',
+        title: clockKind === 'digital' ? '拖动移动。点击切换指针钟。' : '拖动移动。点击切换数字钟。',
         onPointerDown: onClockDown,
         onClick: onClock,
         children: [
@@ -3515,7 +3515,7 @@ function BotPicker({ roster, bot, look }) {
     className: 'office-task-who',
     ref: boxRef,
     children: [
-      jsx('span', { children: 'Task for' }),
+      jsx('span', { children: '派给' }),
       jsxs('div', {
         className: 'office-pick',
         children: [
@@ -3524,7 +3524,7 @@ function BotPicker({ roster, bot, look }) {
             className: 'office-pick-btn',
             'aria-haspopup': 'listbox',
             'aria-expanded': open,
-            'aria-label': 'Pick a bot',
+            'aria-label': '选择机器人',
             onClick: () => setOpen(on => !on),
             children: look.title
           }),
@@ -3650,7 +3650,7 @@ function TaskBar({ roster, activeProfile }) {
       setText('')
     } catch (err) {
       setText(task)
-      try { host.notifyError(err, `Could not send to ${look.title}`) } catch { /* older shell */ }
+      try { host.notifyError(err, `无法发送给 ${look.title}`) } catch { /* older shell */ }
     } finally {
       setBusy(false)
     }
@@ -3668,31 +3668,31 @@ function TaskBar({ roster, activeProfile }) {
         ref: inputRef,
         className: cn('office-task-input', job?.state === JOB_STATES.FAILED && 'is-failed'),
         value: text,
-        placeholder: sending ? `${look.title} is on it…` : job?.state === JOB_STATES.FAILED ? 'Review the failed task and try again…' : `Tell ${look.title}…`,
+        placeholder: sending ? `${look.title} 正在处理…` : job?.state === JOB_STATES.FAILED ? '检查失败的任务并重试…' : `告诉 ${look.title}…`,
         disabled: busy || sending || unknown,
         'aria-describedby': job?.error ? 'office-task-status' : undefined,
         onChange: event => setText(event.target.value)
       }),
       unknown
         ? jsxs(Fragment, { children: [
-            jsx('button', { type: 'button', className: 'office-task-recover', onClick: () => void openBot(bot), children: 'open chat' }),
+            jsx('button', { type: 'button', className: 'office-task-recover', onClick: () => void openBot(bot), children: '打开聊天' }),
             jsx('button', {
               type: 'button',
               className: 'office-task-recover',
               onClick: async () => {
                 const copied = await pluginCtx?.os?.writeClipboard?.(job.prompt)
-                if (!copied) host.notify?.({ kind: 'error', message: 'Could not copy the task.' })
+                if (!copied) host.notify?.({ kind: 'error', message: '无法复制任务。' })
               },
-              children: 'copy task'
+              children: '复制任务'
             }),
-            jsx('button', { type: 'button', className: 'office-task-recover', onClick: () => clearJob(bot.name, job.id), children: 'dismiss' })
+            jsx('button', { type: 'button', className: 'office-task-recover', onClick: () => clearJob(bot.name, job.id), children: '忽略' })
           ] })
         : jsx('button', {
             ref: sendRef,
             type: 'submit',
             className: 'office-task-send',
             disabled: busy || sending || !text.trim(),
-            children: sending ? 'on it' : job?.state === JOB_STATES.FAILED ? 'Retry' : 'Send'
+            children: sending ? '处理中' : job?.state === JOB_STATES.FAILED ? '重试' : '发送'
           }),
       job?.error ? jsx('span', { id: 'office-task-status', className: 'office-task-status', role: 'status', children: job.error }) : null
     ]
@@ -3701,33 +3701,33 @@ function TaskBar({ roster, activeProfile }) {
 
 // Office life is local stagecraft. It never dispatches work or invents job events.
 const OFFICE_QUIRKS = [
-  { id: 'mugs', name: 'Mug collector', line: 'That is my backup backup mug.', prop: 'coffee' },
-  { id: 'tidy', name: 'Compulsive tidier', line: 'Who moved this three pixels?', prop: 'bin' },
-  { id: 'champion', name: 'Victory enthusiast', line: 'I would like to thank the keyboard.', prop: 'chair' },
-  { id: 'quiet', name: 'Quiet achiever', line: 'I left it on your desk.', prop: 'cat' },
-  { id: 'curious', name: 'Button investigator', line: 'It probably does something sensible.', prop: 'fan' }
+  { id: 'mugs', name: '马克杯收藏家', line: '这是我备用杯子的备用杯子。', prop: 'coffee' },
+  { id: 'tidy', name: '强迫症整理狂', line: '谁把它挪了三像素？', prop: 'bin' },
+  { id: 'champion', name: '胜利爱好者', line: '我要感谢键盘。', prop: 'chair' },
+  { id: 'quiet', name: '低调实干家', line: '我把它放你桌上了。', prop: 'cat' },
+  { id: 'curious', name: '按钮调查员', line: '它大概会做点合理的事。', prop: 'fan' }
 ]
 const OFFICE_FURNITURE = [
-  { id: 'coffee', name: 'Coffee machine', unlock: 0, x: 17, y: 79 },
-  { id: 'fan', name: 'Desk fan', unlock: 0, x: 35, y: 81 },
-  { id: 'chair', name: 'Rolling chair', unlock: 0, x: 53, y: 78 },
-  { id: 'bin', name: 'Paper bin', unlock: 0, x: 69, y: 83 },
-  { id: 'cat', name: 'Office cat', unlock: 0, x: 83, y: 78 },
-  { id: 'certificate', name: 'First delivery certificate', unlock: 1, x: 12, y: 63 },
-  { id: 'aquarium', name: 'Fish tank', unlock: 5, x: 31, y: 65 },
-  { id: 'button', name: 'Suspicious button', unlock: 10, x: 66, y: 67 },
-  { id: 'pizza-box', name: 'Pizza hall of fame', unlock: 20, x: 83, y: 63 }
+  { id: 'coffee', name: '咖啡机', unlock: 0, x: 17, y: 79 },
+  { id: 'fan', name: '桌面风扇', unlock: 0, x: 35, y: 81 },
+  { id: 'chair', name: '滚轮椅', unlock: 0, x: 53, y: 78 },
+  { id: 'bin', name: '废纸篓', unlock: 0, x: 69, y: 83 },
+  { id: 'cat', name: '办公室猫', unlock: 0, x: 83, y: 78 },
+  { id: 'certificate', name: '首次交付证书', unlock: 1, x: 12, y: 63 },
+  { id: 'aquarium', name: '鱼缸', unlock: 5, x: 31, y: 65 },
+  { id: 'button', name: '可疑按钮', unlock: 10, x: 66, y: 67 },
+  { id: 'pizza-box', name: '披萨名人堂', unlock: 20, x: 83, y: 63 }
 ]
 const OFFICE_INCIDENTS = {
-  boss: { title: 'The boss is making the rounds', prop: 'chair', lines: ['Someone has opened the manager\'s door.', 'A quick look at the first desk. Very serious clipboard work.', 'On to the next desk. The coffee mug is under inspection.', 'Everything appears to be approximately in order.', 'Inspection complete. The clipboard returns upstairs.'] },
-  printer: { title: 'The printer has opinions', prop: 'bin', lines: ['The printer has requested more paper. All of it.', 'The fan catches a page. The chair joins the chase.', 'Paper collected. The printer has been asked to reflect.'] },
-  delivery: { title: 'A modest plant delivery', prop: 'coffee', lines: ['A package marked SMALL PLANT has arrived.', 'It is now taller than the delivery bot.', 'The plant has been appointed head of shade.'] },
-  ufo: { title: 'An unscheduled visitor', prop: 'cat', lines: ['A tiny UFO is inspecting the wall portrait.', 'The crew offers a pizza slice in exchange.', 'Portrait returned. Diplomatic relations taste of cheese.'] },
-  mouse: { title: 'Mouse on the loose', prop: 'cat', lines: ['A wind-up mouse makes a break for it.', 'The cat pursues. The rolling chair provides transport.', 'Mouse recovered. The cat is taking the credit.'] },
-  ice: { title: 'Extremely polished carpet', prop: 'chair', lines: ['The carpet is temporarily ice.', 'Nobody has a license for this chair.', 'Traction restored. Dignity will take longer.'] },
-  ball: { title: 'Indoor volleyball committee', prop: 'fan', lines: ['A beach ball enters the meeting.', 'The fan has a surprisingly good serve.', 'Motion to play again carried unanimously.'] },
-  lunch: { title: 'An emergency lunch', prop: 'coffee', lines: ['The lunch bell has been rung.', 'The committee assembles beside the pizza counter.', 'Lunch adjourned. Crumbs remain in the minutes.'] },
-  gravity: { title: 'Gravity is on break', prop: 'chair', lines: ['Gravity has stepped out.', 'Please keep a firm grip on your mug.', 'Everyone is down to earth again. Mostly.'] }
+  boss: { title: '老板来巡视了', prop: 'chair', lines: ['有人推开了经理的门。', '快速扫一眼第一个工位。非常严肃的剪贴板工作。', '来到下一个工位。咖啡杯正被检查。', '一切看起来大致井井有条。', '检查完毕。剪贴板回到楼上。'] },
+  printer: { title: '打印机有话说', prop: 'bin', lines: ['打印机要求更多纸张。全部。', '风扇接住了一张纸。椅子加入了追逐。', '纸张收回了。打印机被要求反省。'] },
+  delivery: { title: '一盆低调的植物送达', prop: 'coffee', lines: ['一个标着「小型植物」的包裹到了。', '它现在比送货机器人还高。', '这盆植物被任命为遮阴主管。'] },
+  ufo: { title: '一位不速之客', prop: 'cat', lines: ['一艘迷你 UFO 正在检查墙上的画像。', '机组提出用一块披萨作为交换。', '画像归还。外交关系尝起来是奶酪味的。'] },
+  mouse: { title: '老鼠出逃', prop: 'cat', lines: ['一只发条老鼠开溜了。', '猫追了上去。滚轮椅提供了载具。', '老鼠抓回来了。猫在邀功。'] },
+  ice: { title: '地板极度过滑', prop: 'chair', lines: ['地毯暂时变成了冰。', '没人有这把椅子的驾照。', '摩擦力恢复了。尊严还要再等等。'] },
+  ball: { title: '室内排球委员会', prop: 'fan', lines: ['一个沙滩球闯进了会议。', '风扇的发球出奇地好。', '再打一场的动议全票通过。'] },
+  lunch: { title: '一顿紧急午餐', prop: 'coffee', lines: ['午餐铃响了。', '委员会在披萨柜台旁集合。', '午餐散会。会议纪要里留下了面包屑。'] },
+  gravity: { title: '重力休假了', prop: 'chair', lines: ['重力出门了。', '请牢牢握住你的杯子。', '大家又脚踏实地了。基本如此。'] }
 }
 const $officeLife = atom({ quirks: {}, props: {}, stories: [], chaos: 'gentle' })
 const $officeIncident = atom(null)
@@ -3766,12 +3766,12 @@ function incidentLine(incident) {
   const def = OFFICE_INCIDENTS[incident.kind]
   if (incident.kind === 'boss') return def.lines[incident.phase]
   const visible = id => officePropPosition(id).visible !== false
-  if (incident.phase === 2 && incident.kind === 'mouse' && !visible('cat')) return 'Mouse recovered. The office has survived another experiment.'
+  if (incident.phase === 2 && incident.kind === 'mouse' && !visible('cat')) return '老鼠抓回来了。办公室又挺过了一次实验。'
   if (incident.phase !== 1) return def.lines[incident.phase]
-  if (!incident.cast.length) return 'Everyone is working. The office objects are handling this one.'
-  if (incident.kind === 'mouse' && (!visible('cat') || !visible('chair'))) return 'The mouse evades the office search party.'
-  if (incident.kind === 'printer' && (!visible('fan') || !visible('chair'))) return 'The paper is piling up. A search party enters the pile.'
-  if (incident.kind === 'ball' && !visible('fan')) return 'The office practices a very informal serve.'
+  if (!incident.cast.length) return '大家都在工作。这件事交给办公室的物件处理了。'
+  if (incident.kind === 'mouse' && (!visible('cat') || !visible('chair'))) return '老鼠躲过了办公室搜索队。'
+  if (incident.kind === 'printer' && (!visible('fan') || !visible('chair'))) return '纸张越堆越高。搜索队钻进了纸堆。'
+  if (incident.kind === 'ball' && !visible('fan')) return '办公室在练习一种非常随意的发球。'
   return def.lines[1]
 }
 
@@ -3863,13 +3863,13 @@ function beginOfficeIncident(kind, roster, jobs, activeProfile, turnBusy, roomEl
     $officeIncident.set({ kind, cast, at: Date.now(), phase: 0, tour: [entry, desks[0] || entry, desks[1] || desks[0] || entry, entry] })
     for (const name of cast) {
       startWalkHome(name, roomEl)
-      officeSay(name, officeQuirk(name).id === 'mugs' ? 'Quick. Hide the extra mugs.' : 'I was just about to do that.')
+      officeSay(name, officeQuirk(name).id === 'mugs' ? '快。把多余的杯子藏起来。' : '我正要去做那件事。')
     }
     return true
   }
   $officeIncident.set({ kind, cast, at: Date.now(), phase: 0 })
   gatherOffice(cast, def.prop, roomEl)
-  if (cast[0]) officeSay(cast[0], 'I will investigate.', 4000)
+  if (cast[0]) officeSay(cast[0], '我去调查。', 4000)
   if (kind === 'lunch') $pizza.set(freshPizza(Date.now()))
   return true
 }
@@ -3892,10 +3892,10 @@ function tickOfficeLife(now, roster, jobs, activeProfile, turnBusy, roomEl) {
       $officeIncident.set({ ...incident, phase })
       if (incident.kind === 'boss') {
         const visited = incident.tour?.[phase < 2 ? 1 : 2]?.name
-        if (visited && cast.includes(visited)) officeSay(visited, officeQuirk(visited).id === 'quiet' ? 'The result is on your desk.' : 'This is my professional face.')
+        if (visited && cast.includes(visited)) officeSay(visited, officeQuirk(visited).id === 'quiet' ? '结果在你桌上。' : '这是我的职业面孔。')
         return
       }
-      if (cast[phase % Math.max(1, cast.length)]) officeSay(cast[phase % cast.length], phase === 1 ? officeQuirk(cast[phase % cast.length]).line : 'Nothing to report. Absolutely nothing.')
+      if (cast[phase % Math.max(1, cast.length)]) officeSay(cast[phase % cast.length], phase === 1 ? officeQuirk(cast[phase % cast.length]).line : '无可奉告。绝对没有。')
       if (phase === 1) gatherOffice(cast, incident.kind === 'lunch' ? 'cat' : 'chair', roomEl)
       if (phase === 2 && incident.kind === 'lunch') cast.forEach(name => startWalkToBar(name, roomEl))
     }
@@ -3916,8 +3916,8 @@ function tickOfficeLife(now, roster, jobs, activeProfile, turnBusy, roomEl) {
     const q = officeQuirk(name)
     if (officePropPosition(q.prop).visible !== false) gatherOffice([name], q.prop, roomEl)
     const previous = $officeLife.get().stories.filter(s => s.scene && s.cast.includes(name)).at(-1)
-    officeSay(name, previous ? `For the record, ${OFFICE_INCIDENTS[previous.scene].title.toLowerCase()} was not my idea.` : q.line)
-    if (cast[1] && cast[1] !== name) officeSay(cast[1], q.id === 'mugs' ? 'We have run out of cupboard.' : 'Putting that in the minutes.')
+    officeSay(name, previous ? `声明一下，${OFFICE_INCIDENTS[previous.scene].title.toLowerCase()} 不是我的主意。` : q.line)
+    if (cast[1] && cast[1] !== name) officeSay(cast[1], q.id === 'mugs' ? '我们的橱柜装不下了。' : '记进会议纪要。')
   }
 }
 
@@ -3937,12 +3937,12 @@ function OfficeBoss() {
   const pose = reducedMotion()
     ? { ...incident.tour[incident.phase < 2 ? 1 : incident.phase < 4 ? 2 : 3], walking: false }
     : bossPosition(incident.tour, now - incident.at)
-  return jsxs('div', { className: 'office-boss', style: { left: pose.x, top: pose.y }, role: 'img', 'aria-label': 'The boss inspecting the desks', children: [
+  return jsxs('div', { className: 'office-boss', style: { left: pose.x, top: pose.y }, role: 'img', 'aria-label': '老板正在检查工位', children: [
     jsx('span', { className: 'office-boss-hair' }),
     jsx(WorkerFace, { color: '#d5ae8c', mood: 'idle', size: 42, name: 'office-manager' }),
     jsx('span', { className: 'office-boss-glasses' }),
     jsx('span', { className: 'office-clipboard' }),
-    jsx('span', { className: 'office-boss-label', children: pose.walking ? 'Making the rounds' : 'A few notes...' })
+    jsx('span', { className: 'office-boss-label', children: pose.walking ? '巡视中' : '记几笔…' })
   ] })
 }
 
@@ -3970,8 +3970,8 @@ function OfficeFurniture({ item, roomRef, onUse }) {
   }
   return jsxs('button', {
     type: 'button', className: 'office-furniture', 'data-office-prop': item.id, style: { left: `${item.x}%`, top: `${15 + (item.y - 48) / 40 * 65}%` },
-    title: arrange ? `${item.name}: drag or use arrow keys to move` : `Use ${item.name}`,
-    'aria-label': arrange ? `Move ${item.name}` : `Use ${item.name}`,
+    title: arrange ? `${item.name}：拖动或用方向键移动` : `使用${item.name}`,
+    'aria-label': arrange ? `移动${item.name}` : `使用${item.name}`,
     onPointerDown: event => {
       event.stopPropagation()
       if (arrange) { gesture.current = true; event.currentTarget.setPointerCapture(event.pointerId) }
@@ -4005,7 +4005,7 @@ function OfficeLifeScene({ roster, jobs, activeProfile, turnBusy, roomRef }) {
     jsxs('div', { className: 'office-lounge-sofa', 'aria-hidden': true, children: [jsx('i', {}), jsx('b', {})] }),
     ...OFFICE_FURNITURE.filter(p => life.props[p.id]?.visible ?? p.unlock === 0).map(p => jsx(OfficeFurniture, { item: { ...p, ...life.props[p.id] }, roomRef, onUse: useProp }, p.id)),
     incident ? jsxs('div', { className: 'office-incident-art', 'aria-hidden': true, children: [jsx('span', { className: 'office-visiting-object' }), ...Array.from({ length: 6 }, (_, i) => jsx('i', { style: { '--n': i } }, i))] }) : null,
-    jsx('span', { className: 'office-floor-plaque', children: 'Please feed the ideas. And the cat.' })
+    jsx('span', { className: 'office-floor-plaque', children: '请喂养创意。还有猫。' })
   ] })
 }
 
@@ -4040,23 +4040,23 @@ function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
   useEffect(() => () => { endOfficeIncident(); $officeArrange.set(false); $officeChatter.set({}); officeNextIncident = 0; officeNextQuirk = 0 }, [])
   const action = (label, click, extra = {}) => jsx('button', { type: 'button', className: 'office-life-button', onClick: click, ...extra, children: label }, label)
   const toggle = name => { setPanel(panel === name ? null : name); $officeArrange.set(false) }
-  return jsxs('section', { className: 'office-life', 'aria-label': 'Life in the office', children: [
+  return jsxs('section', { className: 'office-life', 'aria-label': '办公室生活', children: [
     jsxs('div', { className: 'office-life-toolbar', children: [
-      jsx('span', { className: 'office-life-caption', children: 'After hours, during hours.' }),
-      action('Toy drawer', () => toggle('toys'), { 'aria-expanded': panel === 'toys' }),
-      action('Furnish', () => toggle('furnish'), { 'aria-expanded': panel === 'furnish' }),
-      arrange ? action('Finish arranging', () => $officeArrange.set(false)) : null,
-      action('Personalities', () => toggle('people'), { 'aria-expanded': panel === 'people' }),
-      action('Office newspaper', () => toggle('paper'), { 'aria-expanded': panel === 'paper' }),
-      jsxs('label', { className: 'office-chaos', children: ['Office energy ', jsxs('select', { value: life.chaos, onChange: e => { saveOfficeLife({ ...life, chaos: e.target.value }); officeNextIncident = 0 }, children: [jsx('option', { value: 'quiet', children: 'Quiet' }), jsx('option', { value: 'gentle', children: 'A little odd' }), jsx('option', { value: 'chaos', children: 'Chaos' })] })] })
+      jsx('span', { className: 'office-life-caption', children: '下班时间，也在营业。' }),
+      action('玩具抽屉', () => toggle('toys'), { 'aria-expanded': panel === 'toys' }),
+      action('布置家具', () => toggle('furnish'), { 'aria-expanded': panel === 'furnish' }),
+      arrange ? action('完成布置', () => $officeArrange.set(false)) : null,
+      action('性格', () => toggle('people'), { 'aria-expanded': panel === 'people' }),
+      action('办公室报纸', () => toggle('paper'), { 'aria-expanded': panel === 'paper' }),
+      jsxs('label', { className: 'office-chaos', children: ['办公室氛围 ', jsxs('select', { value: life.chaos, onChange: e => { saveOfficeLife({ ...life, chaos: e.target.value }); officeNextIncident = 0 }, children: [jsx('option', { value: 'quiet', children: '安静' }), jsx('option', { value: 'gentle', children: '轻微怪诞' }), jsx('option', { value: 'chaos', children: '混乱' })] })] })
     ] }),
-    incident ? jsxs('div', { className: 'office-incident-caption', role: 'status', children: [jsx('strong', { children: OFFICE_INCIDENTS[incident.kind].title }), jsx('span', { children: incidentLine(incident) }), action('End scene', () => endOfficeIncident(now))] }) : null,
+    incident ? jsxs('div', { className: 'office-incident-caption', role: 'status', children: [jsx('strong', { children: OFFICE_INCIDENTS[incident.kind].title }), jsx('span', { children: incidentLine(incident) }), action('结束场景', () => endOfficeIncident(now))] }) : null,
     panel ? jsxs('div', { className: 'office-life-panel', onKeyDown: e => { if (e.key === 'Escape') { setPanel(null); $officeArrange.set(false) } }, children: [
-      action('Close', () => { setPanel(null); $officeArrange.set(false) }, { className: 'office-panel-close' }),
-      panel === 'toys' ? jsxs(Fragment, { children: [jsx('h2', { children: 'For research purposes.' }), jsx('p', { children: 'Short office scenes. Busy bots keep working.' }), jsx('div', { className: 'office-toy-list', children: Object.entries({ mouse: 'Release wind-up mouse', ice: 'Ice the carpet', ball: 'Drop beach ball', lunch: 'Ring lunch bell', gravity: 'Switch off gravity', printer: 'Provoke printer', delivery: 'Order enormous plant', ufo: 'Invite tiny UFO', boss: 'Call the boss' }).map(([id, label]) => action(label, () => { if (beginOfficeIncident(id, roster, jobs, activeProfile, turnBusy, roomRef.current)) setPanel(null) }, { disabled: Boolean(incident) })) })] }) : null,
-      panel === 'furnish' ? jsxs(Fragment, { children: [jsx('h2', { children: 'Make yourself at home.' }), jsx('p', { children: `${total} completed task${total === 1 ? '' : 's'}. Keepsakes unlock as real work gets delivered.` }), action(arrange ? 'Finish arranging' : 'Arrange furniture', () => { $officeArrange.set(!arrange); if (!arrange) setPanel(null) }, { 'aria-pressed': arrange }), arrange ? jsx('p', { children: 'Drag an object on the carpet, or focus it and use the arrow keys.' }) : null, jsx('div', { className: 'office-furniture-list', children: OFFICE_FURNITURE.map(p => { const visible = life.props[p.id]?.visible ?? p.unlock === 0; return action(`${visible ? 'Put away' : 'Place'} ${p.name}${total < p.unlock && !visible ? ` · ${p.unlock} tasks` : ''}`, () => saveOfficeLife({ ...life, props: { ...life.props, [p.id]: { ...officePropPosition(p.id), visible: !visible } } }), { disabled: !visible && total < p.unlock }) }) })] }) : null,
-      panel === 'people' ? jsxs(Fragment, { children: [jsx('h2', { children: 'Every desk has a character.' }), jsx('p', { children: 'Quirks change desk objects, idle habits, reactions, and celebrations.' }), ...roster.map(bot => jsxs('label', { className: 'office-personality-row', children: [jsx('span', { children: botLook(bot).title }), jsxs('select', { value: officeQuirk(bot.name, life).id, onChange: e => saveOfficeLife({ ...life, quirks: { ...life.quirks, [bot.name]: e.target.value } }), children: OFFICE_QUIRKS.map(q => jsx('option', { value: q.id, children: q.name }, q.id)) })] }, bot.name))] }) : null,
-      panel === 'paper' ? jsxs('article', { className: 'office-newspaper', children: [jsx('h2', { children: 'The Carpet Chronicle' }), jsx('p', { className: 'office-paper-date', children: new Date(now).toLocaleDateString(undefined, { dateStyle: 'full' }) }), jsx('p', { children: week && week.start === weekStart(new Date(now)) ? weekLine(week) || 'A quiet week on the carpet.' : 'A fresh week on the carpet.' }), story ? jsxs('div', { className: 'office-memory', children: [jsx('strong', { children: story.scene ? OFFICE_INCIDENTS[story.scene].title : 'From the office records' }), jsx('p', { children: story.text }), jsx('div', { className: 'office-memory-scene', 'aria-label': 'Saved furniture arrangement', children: (story.snapshot || []).map(p => jsx('span', { style: { position: 'absolute', left: `${p.x}%`, top: `${(p.y - 45) * 1.5}%` }, children: jsx(PropArt, { id: p.id }) }, p.id)) }), jsx('p', { children: story.cast.length ? `Present: ${story.cast.join(', ')}` : 'An office-wide incident.' }), action('Close memory', () => setStory(null))] }) : null, life.stories.length ? jsx('ol', { children: [...life.stories].reverse().map((s, i) => jsx('li', { children: jsxs('button', { type: 'button', onClick: () => setStory(s), children: [jsx('time', { dateTime: new Date(s.at).toISOString(), children: new Date(s.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }), ' ', s.text] }) }, `${s.at}-${i}`)) }) : jsx('p', { children: 'No headlines yet. Finish a task or open the toy drawer to give the editor something to print.' })] }) : null
+      action('关闭', () => { setPanel(null); $officeArrange.set(false) }, { className: 'office-panel-close' }),
+      panel === 'toys' ? jsxs(Fragment, { children: [jsx('h2', { children: '用于研究目的。' }), jsx('p', { children: '短小的办公室场景。忙碌的机器人会继续工作。' }), jsx('div', { className: 'office-toy-list', children: Object.entries({ mouse: '放出发条老鼠', ice: '给地毯结冰', ball: '丢沙滩球', lunch: '敲午餐铃', gravity: '关闭重力', printer: '挑衅打印机', delivery: '订购巨型植物', ufo: '邀请迷你 UFO', boss: '叫老板来' }).map(([id, label]) => action(label, () => { if (beginOfficeIncident(id, roster, jobs, activeProfile, turnBusy, roomRef.current)) setPanel(null) }, { disabled: Boolean(incident) })) })] }) : null,
+      panel === 'furnish' ? jsxs(Fragment, { children: [jsx('h2', { children: '别客气，当自己家。' }), jsx('p', { children: `${total} 个已完成任务。纪念品会随着真实交付解锁。` }), action(arrange ? '完成布置' : '摆放家具', () => { $officeArrange.set(!arrange); if (!arrange) setPanel(null) }, { 'aria-pressed': arrange }), arrange ? jsx('p', { children: '在地毯上拖动物件，或聚焦后使用方向键。' }) : null, jsx('div', { className: 'office-furniture-list', children: OFFICE_FURNITURE.map(p => { const visible = life.props[p.id]?.visible ?? p.unlock === 0; return action(`${visible ? '收起' : '放置'} ${p.name}${total < p.unlock && !visible ? ` · ${p.unlock} 个任务` : ''}`, () => saveOfficeLife({ ...life, props: { ...life.props, [p.id]: { ...officePropPosition(p.id), visible: !visible } } }), { disabled: !visible && total < p.unlock }) }) })] }) : null,
+      panel === 'people' ? jsxs(Fragment, { children: [jsx('h2', { children: '每个工位都有个性。' }), jsx('p', { children: '性格会影响工位物件、空闲习惯、反应与庆祝方式。' }), ...roster.map(bot => jsxs('label', { className: 'office-personality-row', children: [jsx('span', { children: botLook(bot).title }), jsxs('select', { value: officeQuirk(bot.name, life).id, onChange: e => saveOfficeLife({ ...life, quirks: { ...life.quirks, [bot.name]: e.target.value } }), children: OFFICE_QUIRKS.map(q => jsx('option', { value: q.id, children: q.name }, q.id)) })] }, bot.name))] }) : null,
+      panel === 'paper' ? jsxs('article', { className: 'office-newspaper', children: [jsx('h2', { children: '地毯纪事报' }), jsx('p', { className: 'office-paper-date', children: new Date(now).toLocaleDateString(undefined, { dateStyle: 'full' }) }), jsx('p', { children: week && week.start === weekStart(new Date(now)) ? weekLine(week) || '地毯上安静的一周。' : '地毯上崭新的一周。' }), story ? jsxs('div', { className: 'office-memory', children: [jsx('strong', { children: story.scene ? OFFICE_INCIDENTS[story.scene].title : '摘自办公室档案' }), jsx('p', { children: story.text }), jsx('div', { className: 'office-memory-scene', 'aria-label': '已保存的家具布置', children: (story.snapshot || []).map(p => jsx('span', { style: { position: 'absolute', left: `${p.x}%`, top: `${(p.y - 45) * 1.5}%` }, children: jsx(PropArt, { id: p.id }) }, p.id)) }), jsx('p', { children: story.cast.length ? `在场：${story.cast.join(', ')}` : '一场席卷办公室的事件。' }), action('关闭回忆', () => setStory(null))] }) : null, life.stories.length ? jsx('ol', { children: [...life.stories].reverse().map((s, i) => jsx('li', { children: jsxs('button', { type: 'button', onClick: () => setStory(s), children: [jsx('time', { dateTime: new Date(s.at).toISOString(), children: new Date(s.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }), ' ', s.text] }) }, `${s.at}-${i}`)) }) : jsx('p', { children: '还没有头条。完成一个任务或打开玩具抽屉，给编辑点可写的东西。' })] }) : null
     ] }) : null
   ] })
 }
@@ -4219,7 +4219,7 @@ function OfficeFloor() {
         children: [
           jsxs('div', {
             children: [
-              jsx('h1', { className: 'office-title', children: 'The Office' })
+              jsx('h1', { className: 'office-title', children: 'AMM OPC Office' })
             ]
           }),
           jsxs('div', {
@@ -4242,7 +4242,7 @@ function OfficeFloor() {
                 ? jsx('button', {
                     type: 'button',
                     className: 'office-news',
-                    title: 'Open the chat',
+                    title: '打开聊天',
                     onClick: () => {
                       scrollToDesk(roomRef.current, newsNames[0])
                       const bot = roster.find(row => row.name === newsNames[0])
@@ -4250,13 +4250,13 @@ function OfficeFloor() {
                         void openBot(bot)
                       }
                     },
-                    children: headerNames(newsNames.map(nameOf), 'has news', 'have news')
+                    children: headerNames(newsNames.map(nameOf), '有新消息', '有新消息')
                   })
                 : null,
               jsxs('button', {
                 type: 'button',
                 className: cn('office-count', (working.length || attention.length) && 'is-link'),
-                title: working.length || attention.length ? 'Scroll to the desk' : undefined,
+                title: working.length || attention.length ? '滚动到工位' : undefined,
                 onClick: () => {
                   const target = inputBots[0] || working[0] || attention[0]
                   if (target) scrollToDesk(roomRef.current, target.name)
@@ -4265,12 +4265,12 @@ function OfficeFloor() {
                 children: [
                   jsx('span', { className: cn('office-pulse', working.length && 'is-live') }),
                   inputBots.length
-                    ? headerNames(inputBots.map(bot => nameOf(bot.name)), 'needs input', 'need input')
+                    ? headerNames(inputBots.map(bot => nameOf(bot.name)), '待输入', '待输入')
                     : working.length
-                    ? headerNames(working.map(bot => nameOf(bot.name)), 'working', 'working')
+                    ? headerNames(working.map(bot => nameOf(bot.name)), '工作中', '工作中')
                     : attention.length
-                      ? headerNames(attention.map(bot => nameOf(bot.name)), 'needs attention', 'need attention')
-                      : externalBusy ? 'Chat is busy' : roster.length ? 'All quiet' : 'No desks yet'
+                      ? headerNames(attention.map(bot => nameOf(bot.name)), '需要关注', '需要关注')
+                      : externalBusy ? '聊天忙碌中' : roster.length ? '一片安静' : '还没有工位'
                 ]
               })
             ]
@@ -4283,19 +4283,19 @@ function OfficeFloor() {
         onPointerDown: onFloor,
         children: [
           jsx('div', { className: 'office-wall', 'aria-hidden': true }),
-          jsxs('div', { className: 'office-door', 'aria-hidden': true, children: [jsx('span', { children: 'MANAGER' }), jsx('i', {})] }),
-          jsxs('div', { className: 'office-noticeboard', 'aria-hidden': true, children: [jsx('i', {}), jsx('b', {}), jsx('span', { children: 'OFFICE NOTES' })] }),
+          jsxs('div', { className: 'office-door', 'aria-hidden': true, children: [jsx('span', { children: '经理' }), jsx('i', {})] }),
+          jsxs('div', { className: 'office-noticeboard', 'aria-hidden': true, children: [jsx('i', {}), jsx('b', {}), jsx('span', { children: '办公室便签' })] }),
           jsx('div', {
             className: 'office-live-status',
             role: 'status',
             'aria-live': 'polite',
             children: inputBots.length
-              ? `${inputBots.map(bot => nameOf(bot.name)).join(', ')} ${inputBots.length === 1 ? 'needs' : 'need'} input. Open their chat to respond.`
+              ? `${inputBots.map(bot => nameOf(bot.name)).join(', ')} 需要输入。打开其聊天以回应。`
               : working.length
-              ? `${working.map(bot => nameOf(bot.name)).join(', ')} ${working.length === 1 ? 'is working' : 'are working'}`
+              ? `${working.map(bot => nameOf(bot.name)).join(', ')} 正在工作`
               : attention.length
-                ? `${attention.map(bot => nameOf(bot.name)).join(', ')} ${attention.length === 1 ? 'needs' : 'need'} attention`
-                : externalBusy ? 'A chat outside the Office is busy.' : ''
+                ? `${attention.map(bot => nameOf(bot.name)).join(', ')} 需要关注`
+                : externalBusy ? '办公室外的聊天正忙。' : ''
           }),
           jsx('div', { className: cn('office-plant', working.length && 'is-lean'), 'aria-hidden': true }),
           jsx(Ambience, { backdrop, tally: Object.values(trophies).reduce((a, b) => a + b, 0), sky, roster, trophies }),
@@ -4314,16 +4314,16 @@ function OfficeFloor() {
           jsx(Puffs, {}),
           jsx(OfficeBoss, {}),
           isLoading
-            ? jsx('div', { className: 'office-empty', children: 'Opening the office…' })
+            ? jsx('div', { className: 'office-empty', children: '正在打开办公室…' })
             : error
               ? jsxs('div', {
                   className: 'office-empty',
-                  children: ['Could not load bots. ', jsx('button', { type: 'button', className: 'office-retry', onClick: () => void refetch(), children: 'Try again' })]
+                  children: ['无法加载机器人。 ', jsx('button', { type: 'button', className: 'office-retry', onClick: () => void refetch(), children: '重试' })]
                 })
               : roster.length === 0
                 ? jsx('div', {
                     className: 'office-empty',
-                    children: 'No bots yet. Create one in Bot Mode, then come back.'
+                    children: '还没有机器人。请先在 Bot Mode 中创建一个，再回来。'
                   })
                 : jsxs(Fragment, {
                     children: [
@@ -4390,7 +4390,7 @@ function OfficeChip() {
   )
 
   return jsx(Tip, {
-    label: thinking ? 'A bot is thinking on the office floor' : 'Open the office',
+    label: thinking ? '有机器人在办公室思考' : '打开办公室',
     children: jsx('button', {
       type: 'button',
       className: cn('px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)', thinking && 'text-foreground'),
@@ -4398,7 +4398,7 @@ function OfficeChip() {
         tap()
         host.navigate('/office')
       },
-      children: thinking ? 'office · live' : 'office'
+      children: thinking ? '办公室 · 活跃' : '办公室'
     })
   })
 }
@@ -4853,11 +4853,11 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 @media (max-width:700px) { .office-header { padding:12px; gap:8px; } .office-room { margin:0 8px; } .office-title { font-size:20px; } .office-life-caption { display:none; } .office-life-toolbar { padding:8px 12px; } .office-chaos { width:100%; } .office-life-panel { right:8px; padding:16px; width:calc(100vw - 52px); } .office-recap { display:none; } }
 @media (prefers-reduced-motion:reduce) { .office-life-scene *, .office-keepsakes *, .office-memory-scene *, .office-room[data-incident] .office-face, .office-room[data-incident] .office-eom, .quirk-champion.is-cheers .office-face { animation:none !important; transition:none !important; } }
 `
-  let style = document.getElementById('hermes-office-css')
+  let style = document.getElementById('amm-opc-office-css')
 
   if (!style) {
     style = document.createElement('style')
-    style.id = 'hermes-office-css'
+    style.id = 'amm-opc-office-css'
     document.head.appendChild(style)
   }
 
@@ -4866,7 +4866,7 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 
 const plugin = {
   id: ID,
-  name: 'Office',
+  name: 'AMM OPC Office',
   register(ctx) {
     pluginCtx = ctx
     injectOfficeCss()
@@ -4934,7 +4934,7 @@ const plugin = {
     ctx.register({
       id: 'nav',
       area: SIDEBAR_NAV_AREA,
-      data: { path: '/office', label: 'Office', codicon: 'organization' }
+      data: { path: '/office', label: 'AMM OPC Office', codicon: 'organization' }
     })
 
     ctx.register({
@@ -4942,8 +4942,8 @@ const plugin = {
       area: PALETTE_AREA,
       data: {
         id: `${ID}.open`,
-        label: 'Open office floor',
-        keywords: ['bots', 'desk', 'floor', 'office', 'bar', 'hopscotch'],
+        label: '打开办公室楼层',
+        keywords: ['机器人', '工位', '楼层', '办公室', '吧台', '跳房子'],
         run: () => host.navigate('/office')
       }
     })

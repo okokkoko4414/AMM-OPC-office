@@ -1,7 +1,7 @@
 {
-  "name": "hermes-office",
+  "name": "amm-opc-office",
   "version": "0.1.0.post1",
-  "description": "View and manage Bot Mode agents in a shared office in Hermes Desktop.",
+  "description": "在 Hermes Desktop 的共享办公室中查看和管理 Bot Mode 智能体。",
   "updater": "none",
   "companions": []
 }
