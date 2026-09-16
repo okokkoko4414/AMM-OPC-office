@@ -36,7 +36,7 @@ def build(check=False):
 
     manifest = {
         "name": name, "version": config["version"],
-        "description": config["description"], "author": "Adolanium",
+        "description": config["description"], "author": "okokkoko4414",
         "manifest_version": 1, "kind": "standalone",
         "provides_tools": [], "provides_hooks": [],
         "provides_middleware": [], "requires_env": [],

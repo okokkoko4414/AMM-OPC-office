@@ -1,72 +1,74 @@
 # AMM OPC Office
 
-A small, increasingly peculiar office for your Hermes bots. One carpeted room, real tasks, a pizza counter, and a cat with no respect for the seating plan.
+给你的 Hermes 机器人一间小型办公室，而且越来越古怪。一间铺着地毯的房间、真实的任务、一个披萨柜台，还有一只完全不把座位安排放在眼里的猫。
 
-## Work at the desks
+## 在工位上工作
 
-Pick a bot by its nameplate, enter a task in the bottom bar, and press Send. An envelope flies to its desk. Each task goes into that bot's existing forever **Bot Chat**, keeping its history in one conversation. Double-click a nameplate or choose **open chat** to go there.
+点击铭牌选中一个机器人，在底部输入框里写下任务，然后按「发送」。一个信封会飞到它的工位。每个任务都会进入该机器人那个永久存在的 **Bot Chat**，历史记录都留在同一个会话里。双击铭牌，或选择 **打开聊天**，即可进入。
 
-Confirmed completions earn a star, leave a parcel on the desk, and send the bot toward the pizza counter. A fresh pizza arrives whenever a task starts. The first finisher to reach the counter gets the slice. Click a parcel or the news notice to open the result.
+被确认完成的任务会赢得一颗星、在桌上留下一件包裹，并把机器人送往披萨柜台。只要有任务开始，就会有新披萨送达。最先跑到柜台的人拿到那块披萨。点击包裹或消息提示即可打开结果。
 
-Session-scoped questions and approval requests make the bot raise a hand. Choose **Raised hand · open question** or the header's needs-input notice to open the corresponding chat. The Office never answers approvals itself. Failed and unconfirmed tasks retain their recovery controls and never earn completion rewards.
+会话内的提问和审批请求会让机器人举手。选择 **举手 · 待答复问题**，或点击顶部的待输入提示，打开对应的聊天。办公室从不自行批复审批。失败和未确认的任务会保留其恢复操作，并且永远不会获得完成奖励。
 
-## Life on the carpet
+## 地毯上的生活
 
-The room now stays compact on large screens, with a furnished coffee area, sofa, noticeboard, and manager's door. Desks have legs and keyboards.
+房间在大屏幕上依然保持紧凑，配有带家具的咖啡区、沙发、公告栏和经理的门。工位也有了桌腿和键盘。
 
-The boss sometimes comes through the manager's door, visits two desks with a clipboard, then leaves. Idle workers head back to their desks and react according to their personalities. Busy workers keep working. You can trigger a visit with **Toy drawer → Call the boss**. A visit lasts twenty seconds and records an incident in the newspaper, without awarding task stars.
+老板偶尔会从经理的门进来，拿着剪贴板巡视两个工位，然后离开。空闲的员工会回到自己的工位，并按各自的性格做出反应。忙碌的员工继续工作。你可以用 **玩具抽屉 → 叫老板来** 触发一次巡视。一次巡视持续二十秒，并在报纸里记下一则事件，但不发放任务星。
 
-**Personalities** lets you give each bot a lasting quirk. Mug collectors accumulate mugs on their desks and visit the coffee machine. Tidiers inspect the paper bin. Victory enthusiasts celebrate loudly through movement, while quiet achievers deliver without confetti. Button investigators gravitate toward the fan. Quirks also change idle remarks and poses. Bots remember incidents they took part in and bring them up later.
+**性格** 让你给每个机器人设定一个持久的小癖好。马克杯收藏家会在桌上越堆越多杯子，并常去咖啡机。强迫症整理狂会检查废纸篓。胜利爱好者会通过动作大声庆祝，而低调实干家则不撒彩带地交付成果。按钮调查员会被风扇吸引。性格还会改变空闲时的台词和姿态。机器人会记住自己参与过的事件，并在之后提起。
 
-**Toy drawer** starts a short scene:
+**玩具抽屉** 会开启一段短场景：
 
-- Release a wind-up mouse for the cat to chase.
-- Ice the carpet and send the rolling chair sliding.
-- Drop a beach ball near the fan.
-- Ring the lunch bell and call idle bots to pizza.
-- Switch off gravity and watch the props float.
-- Provoke a paper-spewing printer.
-- Order an enormous plant.
-- Invite a tiny UFO to inspect the wall portrait.
+- 放出一只发条老鼠让猫去追。
+- 给地毯结冰，让滚轮椅滑起来。
+- 在风扇旁丢一个沙滩球。
+- 敲响午餐铃，把空闲的机器人叫去吃披萨。
+- 关闭重力，看物件漂浮起来。
+- 挑衅一台疯狂吐纸的打印机。
+- 订购一盆巨型植物。
+- 邀请一艘迷你 UFO 来检查墙上的画像。
 
-Scenes unfold in three stages over twelve seconds. Idle bots investigate and exchange remarks. Working bots, held bots, and musical-chairs players are excluded from casting. A bot that starts work during a scene stops participating. **End scene** stops the scene early without recording an invented ending.
+场景在十二秒内分三个阶段展开。空闲的机器人会去查看并互相搭话。正在工作的机器人、被抓住的机器人和正在玩抢椅子的机器人都不会被选入场景。中途开始工作的机器人会自动退出。**结束场景** 会提前终止场景，并且不会虚构一个结局记录下来。
 
-**Office energy** controls spontaneous antics. **Quiet** leaves scenes to you; **A little odd** allows occasional incidents; **Chaos** brings them closer together. The first spontaneous incident waits at least 90 seconds, then completed scenes have a three-minute or 45-second cooldown. Ordinary personality visits happen about every 24 seconds outside Quiet mode. No sounds play.
+**办公室氛围** 控制自发的整蛊。**安静** 把场景完全交给你；**轻微怪诞** 允许偶尔发生事件；**混乱** 则让事件更频繁。第一次自发事件至少等待 90 秒，之后已完成的事件有三分钟或 45 秒的冷却。普通的人格巡视在非安静模式下大约每 24 秒发生一次。不播放任何音效。
 
-## Make it yours
+## 让它变成你的
 
-**Furnish** opens the furniture list. The coffee machine, fan, rolling chair, paper bin, and cat are available immediately. Use any placed object to start its related scene. Put objects away or choose **Arrange furniture**, then drag them around the lounge below the desks. Keyboard users can focus an object and move it with the arrow keys. Positions and visibility survive plugin reloads.
+**布置家具** 会打开家具清单。咖啡机、风扇、滚轮椅、废纸篓和猫一开始就有。使用任何已摆放的物件即可触发对应场景。收起物件，或选择 **摆放家具**，然后在下方的休息区里拖动它们。键盘用户可以聚焦某个物件并用方向键移动。位置和可见性会在插件重载后保留。
 
-Real completed tasks unlock keepsakes:
+真实完成的任务会解锁纪念品：
 
-| Completed tasks | Keepsake |
+| 已完成任务 | 纪念品 |
 | --- | --- |
-| 1 | First delivery certificate |
-| 5 | Fish tank |
-| 10 | Suspicious button |
-| 20 | Pizza hall of fame |
+| 1 | 首次交付证书 |
+| 5 | 鱼缸 |
+| 10 | 可疑按钮 |
+| 20 | 披萨名人堂 |
 
-The **Office newspaper** opens *The Carpet Chronicle*, with the weekly task, pizza, and hopscotch recap. Its latest 60 records include completed tasks, pizza claims, and finished incidents. Select a record to see who was present and the furniture arrangement saved with it. These are miniature scene records, not screenshots or replays of your conversations. Work prompts and result text are not copied into the newspaper.
+**办公室报纸** 会打开《地毯纪事报》，内含每周的任务、披萨和跳房子回顾。它最近的 60 条记录包括已完成的任务、披萨得主和已结束的事件。选择一条记录，可以看到当时谁在场，以及随之保存的家具布置。这些是微型的场景记录，不是截图，也不是你对话的回放。工作提示词和结果文本不会被复制进报纸。
 
-The office also keeps the original petting, dragging, blinking, sleeping, hopscotch, musical chairs, hourly breaks, day/night window, warm desk lamps, and employee-of-the-month portrait. Tap a bot to pet it; hold it still to let it sleep. With a bot selected, arrows nudge it, Shift makes larger steps, Enter opens its chat, and P pets it. **Back to desk** sends a wandering bot home.
+办公室还保留了原有的抚摸、拖动、眨眼、睡觉、跳房子、抢椅子、整点休息、昼夜窗户、温暖的台灯和本月最佳员工画像。点击机器人可以抚摸它；按住不动可以让它睡觉。选中一个机器人后，方向键可以挪动它，Shift 加大步幅，Enter 打开它的聊天，P 抚摸它。**回工位** 会把在外溜达的机器人送回座位。
 
-Reduced-motion settings disable decorative bouncing, spinning, and incident animations. Task controls remain separate from the scene controls. Large rosters scroll inside the room, with furniture below the desks. Older saved background selections migrate to the carpet office; other room themes are no longer offered.
+减少动态效果设置会关闭装饰性的弹跳、旋转和事件动画。任务控件与场景控件彼此独立。机器人较多时，房间内部滚动，家具位于工位下方。更早保存的背景选择会迁移到地毯办公室；其他房间主题不再提供。
 
-## Install
+## 安装
 
-Copy this folder to the machine running Hermes Desktop:
+把这个文件夹复制到运行 Hermes Desktop 的机器上：
 
 ```text
 %USERPROFILE%\AppData\Local\hermes\desktop-plugins\amm-opc-office
 ```
 
-The folder must be named `amm-opc-office`. Press Ctrl+K, then **Reload desktop plugins**. Open **AMM OPC Office** in the sidebar or use **打开办公室楼层** in the command palette.
+文件夹必须命名为 `amm-opc-office`。按 Ctrl+K，然后选择 **Reload desktop plugins**。在侧边栏打开 **AMM OPC Office**，或在命令面板中使用 **打开办公室楼层**。
 
-Use a Desktop build with owner-routed `host.requestProfile`, `host.onEvent`, and `host.openSession`. Office fails closed when it cannot establish who owns a background request. Bot Mode does not need to be on, but its saved names and avatars are reused.
+> 若设置了 `HERMES_HOME` 环境变量，插件根目录为该变量下的 `desktop-plugins\`（本机为 `D:\hermes\desktop-plugins\`），此时上面 `%USERPROFILE%` 下的路径不会被加载。
 
-The installed plugin remains a single `plugin.js` file with the SDK and React supplied by Hermes. The npm packages below are only for local preview development.
+请使用带有归属路由的 `host.requestProfile`、`host.onEvent` 和 `host.openSession` 的 Desktop 版本。当办公室无法确认某个后台请求的归属时，它会安全失败（fail closed）。Bot Mode 无需开启，但它保存的名称和头像会被复用。
 
-## Preview and tests
+安装后的插件仍然只是一个 `plugin.js` 文件，SDK 和 React 由 Hermes 提供。下面的 npm 包仅用于本地预览开发。
+
+## 预览与测试
 
 ```powershell
 npm ci --prefix tools/preview
@@ -74,47 +76,44 @@ node tools/preview/build.mjs
 node tools/preview/serve.mjs
 ```
 
-Open [the interactive preview](http://localhost:4877/preview.html). It renders the actual plugin with a local SDK stand-in and simulated six-second tasks. Its storage is isolated from Hermes. It also has a light/dark toggle.
+打开 [交互式预览](http://localhost:4877/preview.html)。它会用本地 SDK 替身渲染真实插件，并模拟六秒任务。它的存储与 Hermes 隔离，还带有一个明暗主题切换。
 
 ```powershell
 node --test tests/*.test.mjs
 ```
 
-Tests cover task routing and lifecycle, room migration, pizza ownership, animation math, scene casting and cancellation, bounded memories, personality persistence, and input-request correlation.
+测试覆盖任务路由与生命周期、房间迁移、披萨归属、动画数学、场景选角与取消、有界记忆、性格持久化和输入请求关联。
 
-## License
+## 许可证
 
 MIT
 
+## Catalog 包
 
-## Catalog package
+`catalog/` 目录把这个 Desktop 插件打包供 Hermes 插件目录（catalog）使用，
+采用[合并包布局](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk#one-package-both-sdks)。
+Catalog 收录仍在审核中。本仓库不代表已获批准或认可。
 
-The `catalog/` directory packages this Desktop plugin for the Hermes plugin catalog,
-using the [combined package layout](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk#one-package-both-sdks).
-Catalog admission is pending. The repository does not imply approval or endorsement.
-
-To install the package directly before catalog admission:
+在审核通过前，可以直接安装该包：
 
 ```sh
 hermes plugins install okokkoko4414/AMM-OPC-office/catalog
 ```
 
-Restart Hermes Desktop or rescan plugins, then enable the Desktop component in
-Capabilities > Plugins. This package adds no Agent tools, hooks, or middleware.
-It requires Hermes Desktop with combined-package support. On a remote backend,
-the Desktop component must also be installed on the machine running the app.
+重启 Hermes Desktop 或重新扫描插件，然后在 Capabilities > Plugins 中启用 Desktop 组件。
+该包不添加任何 Agent 工具、钩子或中间件。
+它需要支持合并包的 Hermes Desktop。在远程后端上，
+运行应用的机器上也需要安装 Desktop 组件。
 
-The existing root `plugin.js` remains the standalone distribution. Keep one
-installation per Desktop plugin. Before switching from a manual install, back up
-and move its folder out of the Desktop plugin directory; Hermes intentionally
-does not overwrite manual installations. Keep plugin settings when migrating.
+现有的根目录 `plugin.js` 仍是独立分发版本。每个 Desktop 插件请只保留一份安装。
+在从手动安装切换到 catalog 安装之前，请先备份，并把它的文件夹移出 Desktop 插件目录；
+Hermes 有意不覆盖手动安装。迁移时请保留插件设置。
 
-After catalog admission, use `hermes plugins update amm-opc-office` and rescan
-Desktop plugins to adopt a reviewed update. The packaged copy's update and restore
-actions cannot replace its files from GitHub releases. Standalone signed updates
-continue to use the existing root files.
+在 catalog 收录后，使用 `hermes plugins update amm-opc-office` 并重新扫描
+Desktop 插件，即可采纳经过审核的更新。打包副本的更新与恢复操作
+无法用 GitHub release 替换其文件。独立签名更新仍使用现有的根目录文件。
 
-For development, edit the root files, then run `python scripts/build_catalog.py`.
-Commit the resulting `catalog/` files. CI runs `python scripts/build_catalog.py --check`
-to keep the package current, including any companion files. Catalog packaging
-releases use `catalog-v0.1.0-1` and are not marked as the latest standalone release.
+开发时，请编辑根目录文件，然后运行 `python scripts/build_catalog.py`。
+提交生成的 `catalog/` 文件。CI 会运行 `python scripts/build_catalog.py --check`，
+以保持包为最新，包括任何随附文件。Catalog 打包
+发布使用 `catalog-v0.1.0-1`，并且不会被标记为最新的独立发布。
