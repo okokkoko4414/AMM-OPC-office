@@ -4340,6 +4340,50 @@ function sendOsUserMessage(roomId, text) {
   runOsRounds(roomId)
 }
 
+// ── 群管理：重命名 / 追加成员 / 删除（数据层全自主，删除时收尾隐藏成员会话）──
+function renameOsRoom(roomId, name) {
+  const n = String(name || '').trim()
+  if (!n) return false
+  patchRoom(roomId, r => { r.name = n.slice(0, 64); return r })
+  return true
+}
+
+function addOsRoomMembers(roomId, newMembers) {
+  const room = getRoom(roomId)
+  if (!room) return { added: 0 }
+  const have = new Set((room.members || []).map(m => m.key))
+  const add = (newMembers || []).filter(m => m && m.key && !have.has(m.key))
+  if (!add.length) return { added: 0 }
+  let added = 0
+  patchRoom(roomId, r => {
+    for (const m of add) {
+      if (r.members.length >= OS_MAX_MEMBERS) break
+      r.members.push(m)
+      r.watermarks[m.key] = 0 // 新成员从现有历史接入（协议 prompt 只带最近 24 行上下文）
+      added++
+    }
+    return r
+  })
+  return { added }
+}
+
+async function deleteOsRoom(roomId) {
+  const room = getRoom(roomId)
+  if (!room) return false
+  if (room.engine && room.engine.running) stopOsRounds(roomId)
+  for (const [key, sid] of Object.entries(room.sessions || {})) {
+    try {
+      const m = (room.members || []).find(mm => mm.key === key)
+      if (m && m.machine === 'pc2' && typeof host.setPersistedSessionHidden === 'function') {
+        await host.setPersistedSessionHidden(sid, { sessionId: sid, profile: m.seat || m.name, hidden: true })
+      }
+    } catch { /* 尽力而为 */ }
+  }
+  $osRooms.set(($osRooms.get() || []).filter(r => r.roomId !== roomId))
+  saveOsRooms()
+  return true
+}
+
 // ── 合议与台账打通 ──
 function osConcludeToProposal(roomId) {
   const room = getRoom(roomId)
@@ -4548,6 +4592,56 @@ async function osPickAttachment(bot, setText) {
     try { host.notifyError && host.notifyError('无法打开文件选择器') } catch {}
   }
 }
+function OsRenameDialog({ room, onClose }) {
+  const [name, setName] = useState(room.name)
+  return jsxs('div', { className: 'osg-mask', onClick: onClose, children: [
+    jsxs('div', { className: 'osg-dialog', onClick: e => e.stopPropagation(), children: [
+      jsxs('div', { className: 'osg-dialog-title', children: ['重命名群聊'] }),
+      jsx('label', { className: 'osg-field', children: [
+        jsx('span', { children: ['群聊名称'] }),
+        jsx('input', { value: name, onChange: e => setName(e.target.value),
+          onKeyDown: e => { if (e.key === 'Enter' && name.trim()) { renameOsRoom(room.roomId, name); onClose() } } }),
+      ] }),
+      jsxs('div', { className: 'aod-btnrow', children: [
+        jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: !name.trim(), onClick: () => { renameOsRoom(room.roomId, name); onClose() }, children: ['保存'] }),
+        jsxs('button', { className: 'aod-btn', onClick: onClose, children: ['取消'] }),
+      ] }),
+    ] }),
+  ] })
+}
+
+function OsAddMembersDialog({ room, onClose }) {
+  const rosterQuery = useRoster()
+  const pc1 = useFetch(API + '/api/pc1/team')
+  const [sel, setSel] = useState({})
+  const have = new Set((room.members || []).map(m => m.seat))
+  const profiles = (rosterQuery && rosterQuery.data && rosterQuery.data.profiles) || []
+  const pc2Members = profiles.filter(p => p && p.name && !have.has(p.name)).map(p => ({ key: 'pc2:' + p.name, name: p.name, seat: p.name, label: p.title || p.name, machine: 'pc2' }))
+  const pc1Members = ((pc1.data && pc1.data.profiles) || []).filter(p => p && p.name && !have.has('pc1/' + p.name)).map(p => ({ key: 'pc1:' + p.name, name: p.name, seat: 'pc1/' + p.name, label: 'PC1·' + (p.alias || p.name), machine: 'pc1' }))
+  const all = [...pc2Members, ...pc1Members]
+  const chosen = all.filter(m => sel[m.key])
+  const add = () => {
+    addOsRoomMembers(room.roomId, chosen)
+    onClose()
+  }
+  return jsxs('div', { className: 'osg-mask', onClick: onClose, children: [
+    jsxs('div', { className: 'osg-dialog', onClick: e => e.stopPropagation(), children: [
+      jsxs('div', { className: 'osg-dialog-title', children: ['追加成员（已在群 ', room.members.length, ' / 上限 ', OS_MAX_MEMBERS, '）'] }),
+      jsxs('div', { className: 'osg-field', children: [
+        all.length === 0 ? jsxs('div', { className: 'osg-empty', children: ['没有可追加的成员——所有可用席位都已在群里。'] }) : null,
+        jsxs('div', { className: 'osg-member-grid', children: all.map(m => jsxs('label', { className: 'osg-member' + (sel[m.key] ? ' on' : ''), children: [
+          jsx('input', { type: 'checkbox', checked: !!sel[m.key], onChange: () => setSel(v => ({ ...v, [m.key]: !v[m.key] })) }),
+          jsxs('span', { children: [m.label] }),
+        ] }, m.key)) }),
+      ] }),
+      jsxs('div', { className: 'aod-btnrow', children: [
+        jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: !chosen.length, onClick: add, children: ['追加 ', chosen.length, ' 名成员'] }),
+        jsxs('button', { className: 'aod-btn', onClick: onClose, children: ['取消'] }),
+      ] }),
+    ] }),
+  ] })
+}
+
 function OsGroupChat() {
   const rooms = useValue($osRooms) || []
   const [activeId, setActiveId] = useState(null)
@@ -4577,14 +4671,16 @@ function OsGroupChat() {
       ] }),
     ] }),
     jsxs('div', { className: 'osg-main', children: [
-      active ? jsx(OsRoomView, { room: active }) : jsxs('div', { className: 'osg-empty', style: { paddingTop: 80 }, children: ['选择左侧合议群，或发起新合议。'] }),
+      active ? jsx(OsRoomView, { room: active, onDeleted: () => setActiveId(null) }) : jsxs('div', { className: 'osg-empty', style: { paddingTop: 80 }, children: ['选择左侧合议群，或发起新合议。'] }),
     ] }),
     showCreate ? jsx(OsCreateRoomDialog, { onClose: () => setShowCreate(false), onCreated: (room) => { setShowCreate(false); setActiveId(room.roomId) } }) : null,
   ] })
 }
 
-function OsRoomView({ room }) {
+function OsRoomView({ room, onDeleted }) {
   const [draft, setDraft] = useState('')
+  const [dlg, setDlg] = useState(null)
+  const [confirmDel, setConfirmDel] = useState(false)
   const listRef = useRef(null)
   const inputRef = useRef(null)
   const log = room.log || []
@@ -4625,8 +4721,14 @@ function OsRoomView({ room }) {
           jsxs('button', { className: 'aod-btn', onClick: () => runOsRounds(room.roomId, { extraRounds: 3 }), children: ['+3 轮续场'] }),
           jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: conclude, children: ['登记结论为提案'] }),
         ] }) : null,
+        jsxs('button', { className: 'aod-btn', title: '重命名群聊', onClick: () => setDlg('rename'), children: ['✏️'] }),
+        jsxs('button', { className: 'aod-btn', title: '追加成员', onClick: () => setDlg('add'), children: ['➕'] }),
+        confirmDel ? jsxs('button', { className: 'aod-btn aod-btn-danger', onClick: async () => { await deleteOsRoom(room.roomId); onDeleted && onDeleted() }, children: ['确认删除？'] })
+          : jsxs('button', { className: 'aod-btn', title: '删除群聊', onClick: () => setConfirmDel(true), children: ['🗑'] }),
       ] }),
     ] }),
+    dlg === 'rename' ? jsx(OsRenameDialog, { room, onClose: () => setDlg(null) }) : null,
+    dlg === 'add' ? jsx(OsAddMembersDialog, { room, onClose: () => setDlg(null) }) : null,
     eng.running ? jsxs('div', { className: 'osg-progress', children: [
       '正在合议：第 ' + ((eng.round || 0) + 1) + ' 轮' + (eng.currentSeat ? ' · @' + eng.currentSeat + ' 发言中…' : ''),
     ] }) : null,
@@ -7056,7 +7158,7 @@ export default plugin
 
 export const __test = {
   DeskHome, PendingPanel, TaskPanel,
-  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
+  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
