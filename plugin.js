@@ -4561,19 +4561,22 @@ function OsShell() {
         children: ['群聊'],
       }),
     ] }),
-    view === 'deck' ? jsx(DeskHome, {})
-      : view === 'chat' ? jsx(OsGroupChat, {})
-      : jsxs(Fragment, { children: [jsx(Pc1TeamBar, {}), jsx(OfficeFloor, {})] }),
+    jsxs('div', { className: 'amm-os-view', children: [
+      view === 'deck' ? jsx(DeskHome, {})
+        : view === 'chat' ? jsx(OsGroupChat, {})
+        : jsxs(Fragment, { children: [jsx(Pc1TeamBar, {}), jsx(OfficeFloor, {})] }),
+    ] }),
   ] })
 }
 
 // OsShell 视图条样式（并入 desk css 注入器之外的独立小样式，避免与 office 场景样式纠缠）
 const OS_SHELL_CSS = `
-.amm-os-shell{position:relative;min-height:100%}
-.amm-os-viewbar{position:sticky;top:0;z-index:50;display:flex;gap:4px;padding:8px 12px;background:var(--background-default,#1e1e22);border-bottom:1px solid rgba(128,128,128,.25)}
-.amm-os-vtab{padding:5px 16px;border-radius:6px;border:1px solid transparent;background:none;color:inherit;font-size:13px;cursor:pointer;opacity:.7;letter-spacing:1px}
+.amm-os-shell{position:relative;display:flex;flex-direction:column;flex:1;min-height:0;height:100%;width:100%}
+.amm-os-viewbar{flex:none;display:flex;gap:4px;padding:8px 12px;background:color-mix(in srgb, Canvas 92%, transparent);border-bottom:1px solid color-mix(in srgb, CanvasText 18%, transparent)}
+.amm-os-vtab{padding:5px 16px;border-radius:6px;border:1px solid transparent;background:none;color:CanvasText;font:inherit;font-size:13px;cursor:pointer;opacity:.7}
 .amm-os-vtab:hover{opacity:1}
-.amm-os-vtab.on{opacity:1;border-color:rgba(128,128,128,.4);background:rgba(127,127,127,.15);font-weight:600}
+.amm-os-vtab.on{opacity:1;border-color:color-mix(in srgb, CanvasText 30%, transparent);background:color-mix(in srgb, CanvasText 10%, transparent);font-weight:600}
+.amm-os-view{flex:1;min-height:0;display:flex;flex-direction:column;overflow:auto}
 .amm-os-chatph{padding:60px 30px;text-align:center;opacity:.75}
 .amm-os-chatph-t{font-size:18px;font-weight:700;margin-bottom:10px}
 .amm-os-chatph-d{font-size:13px;line-height:1.7}
