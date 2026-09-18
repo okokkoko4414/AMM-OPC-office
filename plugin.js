@@ -4061,6 +4061,1378 @@ function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
   ] })
 }
 
+
+// ══ AMM OPC OS 视图壳（办公室 / 指挥台 / 群聊）══
+const $view = atom('office')
+function OsShell() {
+  const view = useValue($view)
+  return jsxs('div', { className: 'amm-os-shell', children: [
+    jsxs('div', { className: 'amm-os-viewbar', children: [
+      jsxs('button', {
+        className: 'amm-os-vtab' + (view === 'office' ? ' on' : ''),
+        onClick: () => $view.set('office'),
+        children: ['办公室'],
+      }),
+      jsxs('button', {
+        className: 'amm-os-vtab' + (view === 'deck' ? ' on' : ''),
+        onClick: () => $view.set('deck'),
+        children: ['指挥台'],
+      }),
+      jsxs('button', {
+        className: 'amm-os-vtab' + (view === 'chat' ? ' on' : ''),
+        onClick: () => $view.set('chat'),
+        children: ['群聊'],
+      }),
+    ] }),
+    view === 'deck' ? jsx(DeskHome, {})
+      : view === 'chat' ? jsxs('div', { className: 'amm-os-chatph', children: [
+          jsxs('div', { className: 'amm-os-chatph-t', children: ['群聊（合议）'] }),
+          jsxs('div', { className: 'amm-os-chatph-d', children: ['公司级多智能体合议群聊，WP4 开发中。当前请用原生 Bot Mode 群聊。'] }),
+        ] })
+      : jsx(OfficeFloor, {}),
+  ] })
+}
+
+// OsShell 视图条样式（并入 desk css 注入器之外的独立小样式，避免与 office 场景样式纠缠）
+const OS_SHELL_CSS = `
+.amm-os-shell{position:relative;min-height:100%}
+.amm-os-viewbar{position:sticky;top:0;z-index:50;display:flex;gap:4px;padding:8px 12px;background:var(--background-default,#1e1e22);border-bottom:1px solid rgba(128,128,128,.25)}
+.amm-os-vtab{padding:5px 16px;border-radius:6px;border:1px solid transparent;background:none;color:inherit;font-size:13px;cursor:pointer;opacity:.7;letter-spacing:1px}
+.amm-os-vtab:hover{opacity:1}
+.amm-os-vtab.on{opacity:1;border-color:rgba(128,128,128,.4);background:rgba(127,127,127,.15);font-weight:600}
+.amm-os-chatph{padding:60px 30px;text-align:center;opacity:.75}
+.amm-os-chatph-t{font-size:18px;font-weight:700;margin-bottom:10px}
+.amm-os-chatph-d{font-size:13px;line-height:1.7}
+`
+function injectOsShellCss() {
+  let el = document.getElementById('amm-os-shell-css')
+  if (!el) { el = document.createElement('style'); el.id = 'amm-os-shell-css'; document.head.appendChild(el) }
+  el.textContent = OS_SHELL_CSS
+}
+
+// ══ 指挥台面板（原 amm-opc-desk 搬入）══
+// el()：统一 JSX 入口 —— 把 props 里的 key 抽出来按 jsx-runtime 规范传第三参
+// （React 19 起 key 放 props 会告警且失效；第三参就是 key 槽位，children 永远在 props 里）
+// 另：数组 children 若缺 key，自动按 index 补（静态字面量数组无语义 key，仅消警告）
+function el(type, props) {
+  if (!props) return jsx(type, props)
+  let { key, children, ...rest } = props
+  if (Array.isArray(children)) {
+    children = children.map((c, i) =>
+      c && typeof c === 'object' && c.key == null ? { ...c, key: '@k' + i } : c)
+  }
+  const p = children === undefined ? rest : { ...rest, children }
+  return key !== undefined ? jsx(type, p, key) : jsx(type, p)
+}
+
+const API = 'http://127.0.0.1:8901'
+
+const SEATS = ['ceo', 'research-lead', 'strategy-director', 'quality-auditor',
+  'skills-architect', 'workflow-designer', 'controller', 'independent-reviewer']
+
+// 决策事项八步议事的阶段链（已裁定/已废止 = 闭环态，不再出现在悬决清单）
+const PROPOSAL_STAGES = ['提案中', '事实收集中', '方案比选中', '合议中', '已裁定']
+
+const EXPENSE_CATEGORIES = ['人力', '场地', '折旧', '运营', '采购', '其他']
+
+const TABS = [
+  { id: 'pending', label: '悬决' },
+  { id: 'tasks', label: '任务' },
+  { id: 'acceptance', label: '验收' },
+  { id: 'ledger', label: '账本' },
+  { id: 'finance', label: '经营' },
+  { id: 'ops', label: '运营' },
+  { id: 'search', label: '检索' },
+]
+
+// ══════════════════════════════════════════════════════════
+// 样式（注入 <style>，半透明 + currentColor，深浅色界面均可用）
+// ══════════════════════════════════════════════════════════
+const CSS = `
+.aod-page{padding:18px 22px 48px;max-width:1080px;font-size:13px;color:inherit}
+.aod-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:16px;border-bottom:1px solid rgba(128,128,128,.25)}
+.aod-tab{padding:7px 14px;cursor:pointer;border:1px solid transparent;border-bottom:none;border-radius:6px 6px 0 0;opacity:.7;background:none;color:inherit;font-size:13px}
+.aod-tab:hover{opacity:1}
+.aod-tab.on{opacity:1;border-color:rgba(128,128,128,.3);background:rgba(127,127,127,.12);font-weight:600}
+.aod-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:2px 0 14px;flex-wrap:wrap}
+.aod-h1{font-size:17px;font-weight:700;margin:0}
+.aod-sub{font-size:12px;opacity:.65;margin-top:3px}
+.aod-stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.aod-stat{flex:1;min-width:130px;border:1px solid rgba(128,128,128,.25);border-radius:8px;padding:10px 12px}
+.aod-stat b{display:block;font-size:20px;margin-top:2px}
+.aod-stat span{font-size:11px;opacity:.65}
+.aod-card{border:1px solid rgba(128,128,128,.25);border-radius:8px;padding:12px 14px;margin-bottom:14px}
+.aod-card h3{margin:0 0 8px;font-size:13px;font-weight:600}
+.aod-tblwrap{overflow-x:auto}
+.aod-tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.aod-tbl th{text-align:left;padding:6px 8px;opacity:.6;font-weight:500;border-bottom:1px solid rgba(128,128,128,.3);white-space:nowrap}
+.aod-tbl td{padding:7px 8px;border-bottom:1px solid rgba(128,128,128,.15)}
+.aod-row{cursor:pointer}
+.aod-row:hover td{background:rgba(127,127,127,.1)}
+.aod-tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;border:1px solid;white-space:nowrap}
+.aod-t-ok{color:#3fb950;border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.08)}
+.aod-t-warn{color:#d29922;border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.08)}
+.aod-t-err{color:#f85149;border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.08)}
+.aod-t-info{color:#58a6ff;border-color:rgba(88,166,255,.4);background:rgba(88,166,255,.08)}
+.aod-t-mute{opacity:.7;border-color:rgba(128,128,128,.4)}
+.aod-btn{padding:5px 12px;border-radius:6px;border:1px solid rgba(128,128,128,.4);background:rgba(127,127,127,.12);color:inherit;cursor:pointer;font-size:12.5px}
+.aod-btn:hover:not(:disabled){background:rgba(127,127,127,.24)}
+.aod-btn:disabled{opacity:.5;cursor:wait}
+.aod-btn-pri{background:#2f6feb;border-color:#2f6feb;color:#fff}
+.aod-btn-pri:hover:not(:disabled){background:#4480f6}
+.aod-btn-danger{border-color:rgba(248,81,73,.5);color:#f85149}
+.aod-btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.aod-drawer-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:900}
+.aod-drawer{position:fixed;top:0;right:0;bottom:0;width:430px;max-width:92vw;background:#1e1e22;border-left:1px solid rgba(128,128,128,.35);z-index:901;overflow-y:auto;box-shadow:-8px 0 24px rgba(0,0,0,.35);color:#e6e6e6}
+.aod-drawer-head{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid rgba(128,128,128,.25);position:sticky;top:0;background:#1e1e22;z-index:1}
+.aod-drawer-title{font-weight:700;font-size:14px}
+.aod-drawer-close{background:none;border:none;color:inherit;font-size:16px;cursor:pointer;opacity:.7}
+.aod-drawer-body{padding:14px 16px 30px}
+.aod-kv{display:flex;gap:10px;padding:6px 0;border-bottom:1px dashed rgba(128,128,128,.15);font-size:12.5px}
+.aod-kv-k{width:92px;flex:none;opacity:.6}
+.aod-kv-v{flex:1;word-break:break-all}
+.aod-form{margin-top:14px;border-top:1px solid rgba(128,128,128,.25);padding-top:12px}
+.aod-form-title{font-weight:600;margin-bottom:10px;font-size:13px}
+.aod-field{display:block;margin-bottom:10px}
+.aod-field-label{display:block;font-size:11.5px;opacity:.65;margin-bottom:3px}
+.aod-field input,.aod-field select{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid rgba(128,128,128,.4);border-radius:6px;background:rgba(127,127,127,.08);color:inherit;font-size:12.5px}
+.aod-msg{margin-top:10px;padding:8px 10px;border-radius:6px;font-size:12.5px}
+.aod-m-ok{background:rgba(63,185,80,.12);color:#3fb950}
+.aod-m-err{background:rgba(248,81,73,.12);color:#f85149}
+.aod-note{font-size:11.5px;opacity:.6;margin-top:8px;line-height:1.6}
+.aod-load,.aod-empty{padding:26px 0;text-align:center;opacity:.6;font-size:13px}
+.aod-err{padding:14px;border:1px solid rgba(248,81,73,.4);border-radius:8px;margin:10px 0}
+.aod-grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.aod-search{width:100%;box-sizing:border-box;padding:8px 12px;border:1px solid rgba(128,128,128,.4);border-radius:8px;background:rgba(127,127,127,.08);color:inherit;font-size:13px;margin-bottom:12px}
+`
+
+function injectDeskCss() {
+  let el = document.getElementById('amm-opc-desk-css')
+  if (!el) {
+    el = document.createElement('style')
+    el.id = 'amm-opc-desk-css'
+    document.head.appendChild(el)
+  }
+  el.textContent = CSS
+}
+
+// ══════════════════════════════════════════════════════════
+// Hooks
+// ══════════════════════════════════════════════════════════
+function useFetch(url) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    let alive = true
+    fetch(url)
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json() })
+      .then(d => { if (alive) { setData(d); setLoading(false); setError(null) } })
+      .catch(e => { if (alive) { setLoading(false); setError(String(e && e.message || e)) } })
+    return () => { alive = false }
+  }, [url, tick])
+  return { data, loading, error, refresh: () => setTick(t => t + 1) }
+}
+
+function useAction() {
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState(null)
+  const run = (endpoint, body, onDone) => {
+    setBusy(true)
+    setMsg(null)
+    fetch(API + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then(r => r.json())
+      .then(d => {
+        setBusy(false)
+        setMsg({ ok: !!d.ok, text: d.message || d.error || '完成' })
+        if (d.ok && onDone) onDone()
+      })
+      .catch(e => { setBusy(false); setMsg({ ok: false, text: String(e && e.message || e) }) })
+  }
+  return { busy, msg, run }
+}
+
+// ══════════════════════════════════════════════════════════
+// 基础组件
+// ══════════════════════════════════════════════════════════
+function Btn({ children, onClick, kind, disabled }) {
+  const cls = 'aod-btn' + (kind === 'pri' ? ' aod-btn-pri' : kind === 'danger' ? ' aod-btn-danger' : '')
+  return el('button', { className: cls, onClick, disabled: !!disabled, children })
+}
+
+function Tag({ tone, children }) {
+  return el('span', { className: 'aod-tag aod-t-' + (tone || 'mute'), children })
+}
+
+function Stat({ label, value, tone }) {
+  return el('div', { className: 'aod-stat', children: [
+    el('span', { children: [label] }),
+    el('b', { style: tone === 'err' ? { color: '#f85149' } : tone === 'ok' ? { color: '#3fb950' } : null, children: [String(value)] }),
+  ] })
+}
+
+function Card({ title, children }) {
+  return el('div', { className: 'aod-card', children: [
+    title ? el('h3', { key: 'title', children: [title] }) : null,
+    ...Array.isArray(children) ? children : [children],
+  ] })
+}
+
+function Load() { return el('div', { className: 'aod-load', children: ['加载中…'] }) }
+
+function Empty({ children }) { return el('div', { className: 'aod-empty', children: children || ['暂无数据'] }) }
+
+function ErrBox({ children, onRetry }) {
+  return el('div', { className: 'aod-err', children: [
+    el('div', { children: ['⚠ 快照服务不可达：', children] }),
+    el('div', { className: 'aod-note', children: ['请确认 D:\\hermes\\scripts\\ledger_snapshot_server.py 正在运行（127.0.0.1:8901）'] }),
+    onRetry ? el('div', { className: 'aod-btnrow', children: [
+      el(Btn, { onClick: onRetry, children: ['重试'] }),
+    ] }) : null,
+  ] })
+}
+
+function Msg({ msg }) {
+  if (!msg) return null
+  return el('div', { className: 'aod-msg ' + (msg.ok ? 'aod-m-ok' : 'aod-m-err'), children: [msg.text] })
+}
+
+function M2Placeholder({ title, desc, items }) {
+  return el(Card, { title: title, children: [
+    el('div', { children: [desc] }),
+    items && items.length ? el('div', { className: 'aod-btnrow', children: items.map((it, i) =>
+      el(Tag, { key: i, tone: 'mute', children: [it] })) }) : null,
+  ] })
+}
+
+// 表格：cols=表头数组，items=[{key, cells:[...], onClick}]
+function Tbl({ cols, items, empty }) {
+  if (!items || !items.length) return el(Empty, { children: [empty || '暂无数据'] })
+  return el('div', { className: 'aod-tblwrap', children: [
+    el('table', { className: 'aod-tbl', children: [
+      el('thead', { children: [
+        el('tr', { children: cols.map((c, j) => el('th', { key: j, children: [c] })) }),
+      ] }),
+      el('tbody', { children: items.map(it =>
+        el('tr', { key: it.key, className: 'aod-row', onClick: it.onClick, children:
+          it.cells.map((c, j) => el('td', { key: j, children: [c] })) })) }),
+    ] }),
+  ] })
+}
+
+// 通用表单：fields=[{key,label,type,options,default,placeholder}]
+function ActionForm({ title, fields, submitLabel, onSubmit, busy }) {
+  const init = () => {
+    const v = {}
+    for (const f of fields) v[f.key] = f.default != null ? f.default : ''
+    return v
+  }
+  const [vals, setVals] = useState(init)
+  const set = (k, val) => setVals(prev => ({ ...prev, [k]: val }))
+  return el('form', { className: 'aod-form', onSubmit: e => { e.preventDefault(); onSubmit(vals) }, children: [
+    title ? el('div', { key: 'title', className: 'aod-form-title', children: [title] }) : null,
+    ...fields.map(f => el('label', { key: f.key, className: 'aod-field', children: [
+      el('span', { className: 'aod-field-label', children: [f.label] }),
+      f.type === 'select'
+        ? el('select', { value: vals[f.key], onChange: e => set(f.key, e.target.value), children:
+            f.options.map(o => el('option', { key: o, value: o, children: [o] })) })
+        : el('input', {
+            type: f.type || 'text',
+            value: vals[f.key],
+            onChange: e => set(f.key, e.target.value),
+            placeholder: f.placeholder || '',
+          }),
+    ] })),
+    el(Btn, { key: 'submit', kind: 'pri', disabled: busy, onClick: null, children: [submitLabel] }),
+  ] })
+}
+
+// 详情抽屉：fields=[[标签,值]]，children=操作区（按钮/表单）
+function Drawer({ title, subtitle, fields, onClose, children }) {
+  return el(Fragment, { children: [
+    el('div', { className: 'aod-drawer-mask', onClick: onClose }),
+    el('div', { className: 'aod-drawer', children: [
+      el('div', { className: 'aod-drawer-head', children: [
+        el('div', { children: [
+          el('div', { className: 'aod-drawer-title', children: [title] }),
+          subtitle ? el('div', { className: 'aod-sub', children: [subtitle] }) : null,
+        ] }),
+        el('button', { className: 'aod-drawer-close', onClick: onClose, children: ['✕'] }),
+      ] }),
+      el('div', { className: 'aod-drawer-body', children: [
+        ...fields.map(([k, v], i) => el('div', { key: i, className: 'aod-kv', children: [
+          el('span', { className: 'aod-kv-k', children: [k] }),
+          el('span', { className: 'aod-kv-v', children: [v == null || v === '' ? '—' : String(v)] }),
+        ] })),
+        children,
+      ] }),
+    ] }),
+  ] })
+}
+
+// ══════════════════════════════════════════════════════════
+// 工具
+// ══════════════════════════════════════════════════════════
+const fmtDT = s => s ? String(s).replace('T', ' ').slice(0, 16) : '—'
+const fmtD = s => s ? String(s).slice(0, 10) : '—'
+const fen = c => c == null ? '—' : '¥' + (Number(c) / 100).toFixed(2)
+const today = () => new Date().toISOString().slice(0, 10)
+const priorityTone = p => p === 'P1' ? 'err' : p === 'P2' ? 'warn' : 'info'
+const stageTone = s => s === '已裁定' ? 'ok' : s === '已废止' ? 'mute' : 'info'
+const yuanToCents = v => {
+  const n = parseFloat(v)
+  if (!isFinite(n) || n <= 0) return null
+  return Math.round(n * 100)
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 1：悬决清单
+// ══════════════════════════════════════════════════════════
+function PendingPanel() {
+  const { data, loading, error, refresh } = useFetch(API + '/api/ledger/pending')
+  const { busy, msg, run } = useAction()
+  const [sel, setSel] = useState(null) // {kind, item}
+  const [showNew, setShowNew] = useState(false)
+  const onDone = () => { setSel(null); refresh() }
+
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: refresh })
+
+  const s = data.summary || {}
+  const proposals = data.proposals || []
+  const escalations = data.escalations || []
+  const commitments = data.commitments || []
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['悬决清单'] }),
+        el('div', { className: 'aod-sub', children: ['待峰哥处理的事项 · 数据源 PROPOSALS / ESCALATIONS / COMMITMENTS'] }),
+      ] }),
+      el(Btn, { kind: 'pri', onClick: () => setShowNew(v => !v), children: [showNew ? '收起' : '+ 发起提案'] }),
+    ] }),
+
+    el('div', { className: 'aod-stats', children: [
+      el(Stat, { label: '悬决总数', value: s.pendingCount || 0 }),
+      el(Stat, { label: '待决提案', value: s.pendingProposals || 0 }),
+      el(Stat, { label: '待决升级单', value: s.pendingEscalations || 0 }),
+      el(Stat, { label: '未销号承诺', value: s.openCommitments || 0, tone: 'err' }),
+    ] }),
+
+    showNew ? el(Card, { title: '发起提案（八步议事 · 提案中）', children: [
+      el(ActionForm, {
+        title: '',
+        fields: [
+          { key: 'title', label: '提案标题', placeholder: '一句话说清议题' },
+          { key: 'targetAnchor', label: '目标锚（OBJECTIVE 指针）', placeholder: '如 OBJECTIVE §二 读数③' },
+          { key: 'proposerSeat', label: '提案席位', type: 'select', options: SEATS, default: 'ceo' },
+          { key: 'priority', label: '优先级', type: 'select', options: ['P1', 'P2', 'P3'], default: 'P2' },
+          { key: 'deadline', label: '截止日', type: 'date' },
+        ],
+        submitLabel: '提交提案',
+        busy,
+        onSubmit: v => {
+          if (!v.title || !v.targetAnchor) { return }
+          run('/api/action/proposal', v, () => { setShowNew(false); refresh() })
+        },
+      }),
+      el(Msg, { msg: msg }),
+    ] }) : null,
+
+    el(Card, { title: '待决提案（点击行 → 推进阶段）', children: [
+      el(Tbl, {
+        cols: ['提案号', '标题', '提案席位', '优先级', '当前阶段', '截止日'],
+        empty: '无待决提案',
+        items: proposals.map(p => ({
+          key: p.proposalId,
+          onClick: () => setSel({ kind: 'proposal', item: p }),
+          cells: [
+            p.proposalId,
+            p.title,
+            p.proposerSeat,
+            el(Tag, { tone: priorityTone(p.priority), children: [p.priority || '—'] }),
+            el(Tag, { tone: stageTone(p.currentStage), children: [p.currentStage] }),
+            fmtD(p.deadline),
+          ],
+        })),
+      }),
+    ] }),
+
+    el(Card, { title: '待决升级单（点击行 → 回复处置）', children: [
+      el(Tbl, {
+        cols: ['升级单号', '决策号', '发起席位', '触发条件', '最保守默认项', '状态'],
+        empty: '无待决升级单',
+        items: escalations.map(e => ({
+          key: e.escalationId,
+          onClick: () => setSel({ kind: 'escalation', item: e }),
+          cells: [
+            e.escalationId,
+            e.decisionId,
+            e.fromSeat,
+            e.trigger,
+            e.conservativeDefault,
+            el(Tag, { tone: 'warn', children: [e.status || '待决'] }),
+          ],
+        })),
+      }),
+    ] }),
+
+    el(Card, { title: '未销号承诺（点击行 → 销号）', children: [
+      el(Tbl, {
+        cols: ['#', '事项', '负责人', '截止日', '类型'],
+        empty: '无未销号承诺',
+        items: commitments.map(c => ({
+          key: c['序号'],
+          onClick: () => setSel({ kind: 'commitment', item: c }),
+          cells: [
+            '#' + c['序号'],
+            c['事项'],
+            c['负责人'],
+            el(Tag, { tone: c['截止日'] && c['截止日'] < today() ? 'err' : 'mute', children: [fmtD(c['截止日'])] }),
+            c['类型'] || '—',
+          ],
+        })),
+      }),
+    ] }),
+
+    sel && sel.kind === 'proposal' ? el(ProposalDrawer, { p: sel.item, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+    sel && sel.kind === 'escalation' ? el(EscalationDrawer, { e: sel.item, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+    sel && sel.kind === 'commitment' ? el(CommitmentDrawer, { c: sel.item, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+  ] })
+}
+
+function ProposalDrawer({ p, busy, msg, run, onDone, onClose }) {
+  const idx = PROPOSAL_STAGES.indexOf(p.currentStage)
+  const next = idx >= 0 && idx < PROPOSAL_STAGES.length - 1 ? PROPOSAL_STAGES[idx + 1] : null
+  return el(Drawer, {
+    title: p.title,
+    subtitle: p.proposalId + ' · ' + (p.currentStage || ''),
+    onClose,
+    fields: [
+      ['提案号', p.proposalId],
+      ['目标锚', p.targetAnchor],
+      ['提案席位', p.proposerSeat],
+      ['优先级', p.priority],
+      ['当前阶段', p.currentStage],
+      ['截止日', fmtD(p.deadline)],
+      ['创建于', fmtDT(p.createdAt)],
+      ['更新于', fmtDT(p.updatedAt)],
+    ],
+    children: el(Fragment, { children: [
+      next ? el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: p.proposalId, newStage: next }, onDone), children: ['推进至「' + next + '」'] }),
+      ] }) : null,
+      p.currentStage !== '已裁定' && p.currentStage !== '已废止' ? el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { kind: 'danger', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: p.proposalId, newStage: '已废止' }, onDone), children: ['废止提案'] }),
+      ] }) : null,
+      el(Msg, { msg: msg }),
+    ] }),
+  })
+}
+
+function EscalationDrawer({ e, busy, msg, run, onDone, onClose }) {
+  return el(Drawer, {
+    title: '升级单 ' + e.escalationId,
+    subtitle: e.decisionId + ' · ' + (e.status || ''),
+    onClose,
+    fields: [
+      ['决策号', e.decisionId],
+      ['发起席位', e.fromSeat],
+      ['触发条件', e.trigger],
+      ['最保守默认项', e.conservativeDefault],
+      ['状态', e.status],
+      ['提交于', fmtDT(e.submittedAt)],
+    ],
+    children: el(Fragment, { children: [
+      el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/escalation-reply', { escalationId: e.escalationId, status: '已执行', resolution: '峰哥确认执行' }, onDone), children: ['标记已执行'] }),
+        el(Btn, { kind: 'danger', disabled: busy, onClick: () => run('/api/action/escalation-reply', { escalationId: e.escalationId, status: '已否决', resolution: '峰哥否决' }, onDone), children: ['否决'] }),
+      ] }),
+      el(Msg, { msg: msg }),
+    ] }),
+  })
+}
+
+function CommitmentDrawer({ c, busy, msg, run, onDone, onClose }) {
+  return el(Drawer, {
+    title: '#' + c['序号'] + ' ' + c['事项'],
+    subtitle: '负责人 ' + c['负责人'] + ' · 截止 ' + fmtD(c['截止日']),
+    onClose,
+    fields: [
+      ['事项', c['事项']],
+      ['负责人', c['负责人']],
+      ['截止日', fmtD(c['截止日'])],
+      ['类型', c['类型']],
+      ['建议动作', c['建议动作(三选一)']],
+      ['理由', c['理由']],
+      ['出处文件', c['出处文件']],
+      ['首次出现', fmtD(c['首次出现'])],
+      ['归宿', c['归宿'] || '（未销号）'],
+    ],
+    children: el(Fragment, { children: [
+      el(ActionForm, {
+        title: '销号（R-21：开发类承诺必须 A 级证据）',
+        fields: [
+          { key: 'evidenceGrade', label: '证据分级', type: 'select', options: ['A', 'B', 'C'], default: 'A' },
+          { key: 'evidenceNote', label: '证据说明', placeholder: '如：截图 / 测试报告 / 可访问链接' },
+        ],
+        submitLabel: '确认销号',
+        busy,
+        onSubmit: v => run('/api/action/close-commitment', {
+          commitmentId: String(c['序号']),
+          evidenceGrade: v.evidenceGrade,
+          evidenceNote: v.evidenceNote || '已核验',
+          taskCategory: c['类型'] || '',
+        }, onDone),
+      }),
+      el(Msg, { msg: msg }),
+    ] }),
+  })
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 2：任务看板（Q45 修订：接 paperclip issues 真数据 + 本地工单）
+// ══════════════════════════════════════════════════════════
+const KANBAN_BUCKETS = [
+  { id: 'PENDING', label: '待受理', tone: 'mute' },
+  { id: 'EXECUTING', label: '执行中', tone: 'info' },
+  { id: 'AWAITING', label: '待验收', tone: 'warn' },
+  { id: 'DONE', label: '已完成', tone: 'ok' },
+]
+const KANBAN_SIDE = [
+  { id: 'SUSPENDED', label: '已挂起', tone: 'warn' },
+  { id: 'TERMINATED', label: '已终止', tone: 'err' },
+  { id: 'ESCALATED', label: '已升级', tone: 'err' },
+]
+
+function TaskPanel() {
+  const kanban = useFetch(API + '/api/kanban')
+  const local = useFetch(API + '/api/ledger/workorders')
+  const { busy, msg, run } = useAction()
+  const [sel, setSel] = useState(null)
+  const [showNew, setShowNew] = useState(false)
+  const onDone = () => { setSel(null); local.refresh() }
+  const onSyncDone = () => { kanban.refresh() }
+
+  const loading = kanban.loading || local.loading
+  const error = kanban.error || local.error
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: () => { kanban.refresh(); local.refresh() } })
+
+  // paperclip issues（Q45 协议拉取）
+  const kb = (kanban.data && !kanban.data.unreachable && Array.isArray(kanban.data.tasks)) ? kanban.data.tasks : []
+  const kbUnreachable = kanban.data && kanban.data.unreachable
+  // 本地工单
+  const localAll = Array.isArray(local.data) ? local.data : []
+  const localActive = localAll.filter(w => w.status === '进行中')
+
+  // 合并显示：paperclip issues 为主，本地工单为辅（本地工单不在 paperclip 里时也显示）
+  const byBucket = {}
+  for (const b of [...KANBAN_BUCKETS, ...KANBAN_SIDE]) byBucket[b.id] = []
+  for (const t of kb) {
+    const bucket = byBucket[t.status]
+    if (bucket) bucket.push({ ...t, _source: 'paperclip' })
+  }
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['任务看板'] }),
+        el('div', { className: 'aod-sub', children: [
+          kbUnreachable
+            ? 'paperclip 不可达 · 仅显示本地工单'
+            : 'paperclip issues ' + kb.length + ' 条 + 本地工单 ' + localActive.length + ' 条',
+        ] }),
+      ] }),
+      el('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+        el(Btn, { onClick: () => onSyncDone(), children: ['刷新'] }),
+        el(Btn, { kind: 'pri', onClick: () => setShowNew(v => !v), children: [showNew ? '收起' : '+ 新建本地工单'] }),
+      ] }),
+    ] }),
+
+    kbUnreachable ? el('div', { className: 'aod-note', style: { color: '#d29922' }, children: [
+      '⚠ paperclip 任务数据暂不可达（SSH 不可达或 psql 超时）。本地工单仍可操作。不缓存陈旧数据冒充实时（Q45 纪律）。',
+    ] }) : null,
+
+    showNew ? el(Card, { title: '新建本地工单（落 WORKORDERS.jsonl，非 paperclip）', children: [
+      el(ActionForm, {
+        title: '',
+        fields: [
+          { key: 'title', label: '工单标题', placeholder: '要做什么' },
+          { key: 'assignedSeat', label: '派给席位', type: 'select', options: SEATS, default: 'ceo' },
+          { key: 'priority', label: '优先级', type: 'select', options: ['P1', 'P2', 'P3'], default: 'P2' },
+          { key: 'deadline', label: '截止日', type: 'date' },
+        ],
+        submitLabel: '派发工单',
+        busy,
+        onSubmit: v => { if (v.title) run('/api/action/workorder', v, () => { setShowNew(false); local.refresh() }) },
+      }),
+      el(Msg, { msg: msg }),
+    ] }) : null,
+
+    // 四栏（paperclip issues by bucket）
+    el('div', { className: 'aod-grid2', children: KANBAN_BUCKETS.map(b =>
+      el(Card, { key: b.id, title: b.label + '（' + (byBucket[b.id] || []).length + '）', children: [
+        el(Tbl, {
+          cols: ['工单号', '标题', '派给', '优先级'],
+          empty: '无',
+          items: (byBucket[b.id] || []).slice(0, 50).map(t => ({
+            key: t.paperclipRef,
+            onClick: () => setSel(t),
+            cells: [
+              t.workOrderId,
+              (t.title || '').slice(0, 30) + ((t.title || '').length > 30 ? '…' : ''),
+              (t.assignedSeat || '').slice(0, 12),
+              el(Tag, { tone: priorityTone(t.priority), children: [t.priority || '—'] }),
+            ],
+          })),
+        }),
+      ] })
+    ) }),
+
+    // 两角标栏
+    el('div', { className: 'aod-grid2', children: KANBAN_SIDE.map(b =>
+      el(Card, { key: b.id, title: b.label + '（' + (byBucket[b.id] || []).length + '）', children: [
+        el(Tbl, {
+          cols: ['工单号', '标题', '派给', '原始状态'],
+          empty: '无',
+          items: (byBucket[b.id] || []).slice(0, 30).map(t => ({
+            key: t.paperclipRef,
+            onClick: () => setSel(t),
+            cells: [
+              t.workOrderId,
+              (t.title || '').slice(0, 30) + ((t.title || '').length > 30 ? '…' : ''),
+              (t.assignedSeat || '').slice(0, 12),
+              el(Tag, { tone: b.tone, children: [t.paperclipStatus || t.status] }),
+            ],
+          })),
+        }),
+      ] })
+    ) }),
+
+    // 本地工单（非 paperclip 的）
+    localActive.length ? el(Card, { title: '本地工单（WORKORDERS.jsonl · 进行中）', children: [
+      el(Tbl, {
+        cols: ['工单号', '标题', '派给', '优先级', '截止日', '操作'],
+        empty: '',
+        items: localActive.map(w => ({
+          key: w.workOrderId,
+          onClick: () => setSel(w),
+          cells: [
+            w.workOrderId,
+            w.title,
+            w.assignedSeat,
+            el(Tag, { tone: priorityTone(w.priority), children: [w.priority || '—'] }),
+            fmtD(w.deadline),
+            el(Tag, { tone: 'info', children: [w.status] }),
+          ],
+        })),
+      }),
+    ] }) : null,
+
+    sel ? el(KanbanDetailDrawer, { t: sel, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+  ] })
+}
+
+function KanbanDetailDrawer({ t, busy, msg, run, onDone, onClose }) {
+  const isPaperclip = t._source === 'paperclip'
+  return el(Drawer, {
+    title: t.title || t.workOrderId,
+    subtitle: t.workOrderId + ' · ' + (t.paperclipStatus || t.status || ''),
+    onClose,
+    fields: [
+      ['工单号', t.workOrderId],
+      ['标题', t.title],
+      ['派给', t.assignedSeat],
+      ['优先级', t.priority],
+      ['中枢状态', t.status],
+      ['paperclip 原始状态', t.paperclipStatus || '—'],
+      ['paperclipRef', t.paperclipRef || '—'],
+      ['公司', t.company || '—'],
+      ['项目', t.project || '—'],
+      ['截止/开始日', fmtD(t.deadline)],
+      ['更新于', t.updatedAt ? t.updatedAt.slice(0, 16).replace('T', ' ') : '—'],
+      ['数据源', isPaperclip ? 'paperclip（经 SSH+psql 只读拉取）' : '本地 WORKORDERS.jsonl'],
+    ],
+    children: !isPaperclip && (t.status === 'EXECUTING' || t.status === '进行中') ? el(ActionForm, {
+      title: '终止工单（Q4 裁定：峰哥有终止权）',
+      fields: [{ key: 'terminateReason', label: '终止原因', placeholder: '必填' }],
+      submitLabel: '确认终止',
+      busy,
+      onSubmit: v => { if (v.terminateReason) run('/api/action/terminate-workorder', { workOrderId: t.workOrderId, terminateReason: v.terminateReason, terminatedBy: '峰哥' }, onDone) },
+    }) : el('div', { className: 'aod-note', children: [
+      isPaperclip ? 'paperclip 工单的状态变更在 PC1 paperclip 侧操作，决策中枢只读。' : '此工单当前状态不支持操作。',
+    ] }),
+  })
+}
+
+// 旧 WorkorderDrawer 已由 KanbanDetailDrawer 取代（阶段2 Q45 看板协议升级）
+
+// ══════════════════════════════════════════════════════════
+// 面板 3：验收清单
+// ══════════════════════════════════════════════════════════
+function AcceptancePanel() {
+  const { data, loading, error, refresh } = useFetch(API + '/api/ledger/acceptances')
+  const { busy, msg, run } = useAction()
+  const [sel, setSel] = useState(null)
+  const onDone = () => { setSel(null); refresh() }
+
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: refresh })
+
+  const all = Array.isArray(data) ? data : []
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['验收清单'] }),
+        el('div', { className: 'aod-sub', children: ['验收报告由 quality-auditor 签发 · 峰哥点击行给出结论（R-21：A级证据方可通过）'] }),
+      ] }),
+    ] }),
+    el(Card, { title: '验收报告（点击行 → 通过 / 退回）', children: [
+      el(Tbl, {
+        cols: ['报告号', '工单/事项', '验收人', '证据分级', '结论'],
+        empty: '暂无验收报告 —— 工单完工后由 quality-auditor 签发',
+        items: all.map(a => ({
+          key: a.reportId,
+          onClick: () => setSel(a),
+          cells: [
+            a.reportId,
+            a.title || a.workOrderId || '—',
+            a.auditor || 'quality-auditor',
+            el(Tag, { tone: a.evidenceGrade === 'A' ? 'ok' : 'warn', children: [a.evidenceGrade || '—'] }),
+            a.verdict ? el(Tag, { tone: a.verdict === '通过' ? 'ok' : 'err', children: [a.verdict] }) : el(Tag, { tone: 'info', children: ['待结论'] }),
+          ],
+        })),
+      }),
+    ] }),
+    sel ? el(AcceptanceDrawer, { a: sel, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+  ] })
+}
+
+function AcceptanceDrawer({ a, busy, msg, run, onDone, onClose }) {
+  return el(Drawer, {
+    title: '验收报告 ' + a.reportId,
+    subtitle: a.title || '',
+    onClose,
+    fields: [
+      ['报告号', a.reportId],
+      ['工单号', a.workOrderId],
+      ['事项', a.title],
+      ['验收人', a.auditor],
+      ['证据分级', a.evidenceGrade],
+      ['证据说明', a.evidenceNote],
+      ['当前结论', a.verdict || '待结论'],
+      ['重做指令', a.reworkInstructions],
+    ],
+    children: a.verdict ? null : el(Fragment, { children: [
+      el(ActionForm, {
+        title: '验收结论',
+        fields: [
+          { key: 'verdict', label: '结论', type: 'select', options: ['通过', '退回'], default: '通过' },
+          { key: 'reworkInstructions', label: '重做指令（退回时必填）', placeholder: '退回时给执行席位的整改指令' },
+        ],
+        submitLabel: '提交结论',
+        busy,
+        onSubmit: v => {
+          if (v.verdict === '退回' && !v.reworkInstructions) { return }
+          run('/api/action/acceptance-verdict', { reportId: a.reportId, verdict: v.verdict, reworkInstructions: v.reworkInstructions || '' }, onDone)
+        },
+      }),
+      el(Msg, { msg: msg }),
+    ] }),
+  })
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 4：决策对账（REP-05 口径 · Q8 append-only：更正=追加行）
+// ══════════════════════════════════════════════════════════
+function latestRecon(rows, id) {
+  let last = null
+  for (const r of rows) if (r.type === 'recon' && r.decisionId === id) last = r
+  return last
+}
+
+function nextDueDate(d) {
+  const cands = [d['对账日_30天'], d['对账日_90天'], d['对账日_180天']].filter(Boolean).sort()
+  for (const c of cands) if (c >= today()) return c
+  return cands[cands.length - 1] || null
+}
+
+function RulingsCard() {
+  const { data, loading, error, refresh } = useFetch(API + '/api/ledger/rulings')
+  const { busy, msg, run } = useAction()
+  const [sel, setSel] = useState(null)
+  const onDone = () => { setSel(null); refresh() }
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: refresh })
+  const rows = Array.isArray(data) ? data : []
+  const decisions = rows.filter(r => r.type === 'decision')
+  return el(Card, { title: '决策对账（REP-05 · 30/90/180 天回问 · 点击行登记对账）', children: [
+    el(Tbl, {
+      cols: ['裁定编号', '档位', '裁定日', '事项', '对账日', '回看结果'],
+      empty: '决策账暂无裁定行',
+      items: decisions.map(d => {
+        const recon = latestRecon(rows, d.id)
+        const due = nextDueDate(d)
+        return {
+          key: d.id,
+          onClick: () => setSel(d),
+          cells: [
+            d.id,
+            el(Tag, { tone: d['档位'] === 'L0' ? 'info' : d['档位'] === 'L1' ? 'warn' : 'mute', children: [d['档位'] || '—'] }),
+            fmtD(d['裁定日']),
+            (d['事项'] || '').slice(0, 24) + ((d['事项'] || '').length > 24 ? '…' : ''),
+            fmtD(due),
+            recon
+              ? el(Tag, { tone: recon.verdict === '判断正确' ? 'ok' : 'err', children: [recon.verdict] })
+              : due && due < today()
+                ? el(Tag, { tone: 'warn', children: ['待回问'] })
+                : el(Tag, { tone: 'mute', children: [d['对账状态'] || '未到期'] }),
+          ],
+        }
+      }),
+    }),
+    el(Msg, { msg: msg }),
+    sel ? el(ReconDrawer, { d: sel, rows, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+  ] })
+}
+
+function ReconDrawer({ d, rows, busy, msg, run, onDone, onClose }) {
+  const recon = latestRecon(rows, d.id)
+  return el(Drawer, {
+    title: d['事项'] || d.id,
+    subtitle: d.id + ' · ' + (d['档位'] || ''),
+    onClose,
+    fields: [
+      ['裁定编号', d.id],
+      ['档位', d['档位']],
+      ['裁定日', fmtD(d['裁定日'])],
+      ['目标锚', d['目标锚']],
+      ['参与者', Array.isArray(d['参与者']) ? d['参与者'].join('、') : d['参与者']],
+      ['依据', Array.isArray(d['依据']) ? d['依据'].join('；') : d['依据']],
+      ['结论', d['结论']],
+      ['对账日(30/90/180)', [d['对账日_30天'], d['对账日_90天'], d['对账日_180天']].filter(Boolean).join(' / ')],
+      ['对账状态', recon ? recon.verdict + '（' + fmtD(recon.reconAt) + '）' : (d['对账状态'] || '未到期')],
+      ['更正记录', recon && recon.verdict === '需更正' ? recon.note : '—'],
+    ],
+    children: el(Fragment, { children: [
+      el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/recon', { decisionId: d.id, verdict: '判断正确' }, onDone), children: ['登记对账：判断正确'] }),
+      ] }),
+      el(ActionForm, {
+        title: '需更正（Q8：追加更正行，不改历史）',
+        fields: [{ key: 'note', label: '更正说明', placeholder: '必填：哪里判断错了' }],
+        submitLabel: '登记需更正',
+        busy,
+        onSubmit: v => { if (v.note) run('/api/action/recon', { decisionId: d.id, verdict: '需更正', note: v.note }, onDone) },
+      }),
+      el(Msg, { msg: msg }),
+    ] }),
+  })
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 5：承诺账
+// ══════════════════════════════════════════════════════════
+function CommitmentPanel() {
+  const { data, loading, error, refresh } = useFetch(API + '/api/ledger/commitments')
+  const { busy, msg, run } = useAction()
+  const [sel, setSel] = useState(null)
+  const [filter, setFilter] = useState('open')
+  const [showNew, setShowNew] = useState(false)
+  const onDone = () => { setSel(null); refresh() }
+
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: refresh })
+
+  const all = Array.isArray(data) ? data : []
+  const rows = filter === 'open' ? all.filter(c => !c._closed) : all
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['账本'] }),
+        el('div', { className: 'aod-sub', children: ['决策对账（面板4）+ 承诺账（面板5）· COMMITMENTS.csv 未销号 ' + all.filter(c => !c._closed).length + ' / 总 ' + all.length] }),
+      ] }),
+      el('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+        el(Btn, { onClick: () => setFilter(filter === 'open' ? 'all' : 'open'), children: [filter === 'open' ? '承诺看全部' : '承诺只看未销号'] }),
+        el(Btn, { kind: 'pri', onClick: () => setShowNew(v => !v), children: [showNew ? '收起' : '+ 登记承诺'] }),
+      ] }),
+    ] }),
+
+    el(RulingsCard, { key: 'rulings' }),
+
+    showNew ? el(Card, { title: '登记承诺', children: [
+      el(ActionForm, {
+        title: '',
+        fields: [
+          { key: '事项', label: '承诺事项', placeholder: '必填' },
+          { key: '负责人', label: '负责人（席位）', type: 'select', options: SEATS, default: 'ceo' },
+          { key: '截止日', label: '截止日', type: 'date', default: today() },
+          { key: '类型', label: '类型', type: 'select', options: ['治理', '业务', '开发', '跨机'], default: '业务' },
+          { key: '建议动作', label: '建议动作', type: 'select', options: ['执行', '改期', '撤销'], default: '执行' },
+          { key: '理由', label: '理由', placeholder: '选填' },
+        ],
+        submitLabel: '登记',
+        busy,
+        onSubmit: v => { if (v['事项'] && v['负责人'] && v['截止日']) run('/api/action/commitment', v, () => { setShowNew(false); refresh() }) },
+      }),
+      el(Msg, { msg: msg }),
+    ] }) : null,
+
+    el(Card, { title: '承诺清单（点击行 → 销号）', children: [
+      el(Tbl, {
+        cols: ['#', '事项', '负责人', '截止日', '类型', '归宿'],
+        empty: filter === 'open' ? '全部承诺已销号' : '空',
+        items: rows.map(c => ({
+          key: c['序号'],
+          onClick: () => setSel(c),
+          cells: [
+            '#' + c['序号'],
+            c['事项'],
+            c['负责人'],
+            el(Tag, { tone: !c._closed && c['截止日'] && c['截止日'] < today() ? 'err' : c._closed ? 'ok' : 'mute', children: [fmtD(c['截止日'])] }),
+            c['类型'] || '—',
+            c._closed ? el(Tag, { tone: 'ok', children: [c['归宿'] || '已销号'] }) : el(Tag, { tone: 'warn', children: ['未销号'] }),
+          ],
+        })),
+      }),
+    ] }),
+
+    sel ? el(CommitmentDrawer, { c: sel, busy, msg, run, onDone, onClose: () => setSel(null) }) : null,
+  ] })
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 5：经营面板
+// ══════════════════════════════════════════════════════════
+function FinancePanel() {
+  const { data, loading, error, refresh } = useFetch(API + '/api/finance')
+  const { busy, msg, run } = useAction()
+  const [view, setView] = useState('flows')
+
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: refresh })
+
+  const rev = (data && data.revenue) || []
+  const exp = (data && data.expense) || []
+  const sum = arr => arr.reduce((a, r) => a + (Number(r.amountCents) || 0), 0)
+  const mkey = today().slice(0, 7)
+  const mRev = sum(rev.filter(r => String(r.occurredAt || '').startsWith(mkey)))
+  const mExp = sum(exp.filter(r => String(r.occurredAt || '').startsWith(mkey)))
+  const flows = []
+    .concat(rev.map(r => ({ ...r, _type: '收入' })))
+    .concat(exp.map(r => ({ ...r, _type: '费用' })))
+    .sort((a, b) => String(b.occurredAt || '').localeCompare(String(a.occurredAt || '')))
+
+  // 财务三表口径（REP-07 · R-22 收付实现制 · INV-01 恒等）
+  const byLine = {}
+  for (const r of rev) { const k = r.productLine || '其他'; byLine[k] = (byLine[k] || 0) + (Number(r.amountCents) || 0) }
+  const byCat = {}
+  for (const r of exp) { const k = r.category || '其他'; byCat[k] = (byCat[k] || 0) + (Number(r.amountCents) || 0) }
+  const revTotal = sum(rev)
+  const costTotal = (byCat['人力'] || 0) + (byCat['场地'] || 0)
+  const depTotal = byCat['折旧'] || 0
+  const opexTotal = (byCat['运营'] || 0) + (byCat['其他'] || 0)
+  const purchTotal = byCat['采购'] || 0
+  const expAll = costTotal + depTotal + opexTotal + purchTotal
+  const netProfit = revTotal - expAll
+  const operFlow = revTotal - (costTotal + opexTotal)
+  const investFlow = -(purchTotal + depTotal)
+  const cash = revTotal - expAll
+  const stmtBtn = (id, label) => el(Btn, {
+    key: id, kind: view === id ? 'pri' : null, onClick: () => setView(id), children: [label],
+  })
+  const stmtRow = (label, value, opts) => el('tr', { key: label, children: [
+    el('td', { style: { border: 'none', padding: '5px 8px', opacity: opts && opts.dim ? 0.6 : 1, fontWeight: opts && opts.sum ? 600 : 400, paddingLeft: opts && opts.indent ? 22 : 8 }, children: [label] }),
+    el('td', { style: { border: 'none', padding: '5px 8px', textAlign: 'right', fontWeight: opts && opts.sum ? 700 : 400, color: opts && opts.tone === 'err' ? '#f85149' : opts && opts.tone === 'ok' ? '#3fb950' : null }, children: [value] }),
+  ] })
+  const Stmt = ({ note, rows }) => el('div', { children: [
+    el('table', { className: 'aod-tbl', children: [el('tbody', { children: rows })] }),
+    note ? el('div', { className: 'aod-note', children: [note] }) : null,
+  ] })
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['经营面板'] }),
+        el('div', { className: 'aod-sub', children: ['财务流水账 finance/*.jsonl · 三张报表视图在里程碑②接入（Q35/Q49）'] }),
+      ] }),
+    ] }),
+
+    el('div', { className: 'aod-stats', children: [
+      el(Stat, { label: '累计收入', value: fen(sum(rev)), tone: 'ok' }),
+      el(Stat, { label: '累计支出', value: fen(sum(exp)), tone: 'err' }),
+      el(Stat, { label: '累计净额', value: fen(sum(rev) - sum(exp)) }),
+      el(Stat, { label: '本月净额（' + mkey + '）', value: fen(mRev - mExp) }),
+    ] }),
+
+    el('div', { className: 'aod-grid2', children: [
+      el(Card, { title: '录收入', children: [
+        el(ActionForm, {
+          title: '',
+          fields: [
+            { key: 'productLine', label: '产品线', default: 'GEO119' },
+            { key: 'amount', label: '金额（元）', type: 'number', placeholder: '如 1200.50' },
+            { key: 'occurredAt', label: '发生日期', type: 'date', default: today() },
+            { key: 'voucherRef', label: '凭证号（选填）', placeholder: '如 支付宝流水号' },
+          ],
+          submitLabel: '录入',
+          busy,
+          onSubmit: v => {
+            const cents = yuanToCents(v.amount)
+            if (cents == null) { return }
+            run('/api/action/revenue', { amountCents: cents, productLine: v.productLine || 'GEO119', occurredAt: v.occurredAt || today(), voucherRef: v.voucherRef || '' }, refresh)
+          },
+        }),
+      ] }),
+      el(Card, { title: '录费用', children: [
+        el(ActionForm, {
+          title: '',
+          fields: [
+            { key: 'category', label: '费用类别', type: 'select', options: EXPENSE_CATEGORIES, default: '运营' },
+            { key: 'amount', label: '金额（元）', type: 'number', placeholder: '如 2000' },
+            { key: 'occurredAt', label: '发生日期', type: 'date', default: today() },
+            { key: 'voucherRef', label: '凭证号（选填）', placeholder: '' },
+          ],
+          submitLabel: '录入',
+          busy,
+          onSubmit: v => {
+            const cents = yuanToCents(v.amount)
+            if (cents == null) { return }
+            run('/api/action/expense', { amountCents: cents, category: v.category, occurredAt: v.occurredAt || today(), voucherRef: v.voucherRef || '' }, refresh)
+          },
+        }),
+      ] }),
+    ] }),
+    el(Msg, { msg: msg }),
+    el('div', { className: 'aod-note', children: ['固定成本口径（Q35）：人力 ¥20,000/月 · 场地 ¥2,000/月 · PC 固定资产折旧 —— 需按月手工录入费用，系统不自动生成，避免账实分离。'] }),
+
+    el('div', { className: 'aod-btnrow', style: { marginTop: 0, marginBottom: 10 }, children: [
+      stmtBtn('flows', '流水'), stmtBtn('income', '利润表'), stmtBtn('cashflow', '现金流量表'), stmtBtn('balance', '资产负债表'),
+    ] }),
+
+    view === 'flows' ? el(Card, { title: '收支流水', children: [
+      el(Tbl, {
+        cols: ['类型', '单号', '金额', '明细', '发生日', '凭证'],
+        empty: '暂无流水',
+        items: flows.map(r => ({
+          key: r.recordId,
+          onClick: null,
+          cells: [
+            el(Tag, { tone: r._type === '收入' ? 'ok' : 'err', children: [r._type] }),
+            r.recordId,
+            fen(r.amountCents),
+            r.productLine || r.category || '—',
+            fmtD(r.occurredAt),
+            r.voucherRef || '—',
+          ],
+        })),
+      }),
+    ] }) : null,
+
+    view === 'income' ? el(Card, { title: '利润表（收付实现制 · REP-07）', children: [
+      el(Stmt, {
+        rows: [
+          stmtRow('收入', '', { sum: true }),
+          ...Object.keys(byLine).map(k => stmtRow(k, fen(byLine[k]), { indent: true })),
+          stmtRow('收入合计', fen(revTotal), { sum: true, tone: 'ok' }),
+          stmtRow('成本（人力+场地）', fen(costTotal)),
+          stmtRow('费用（运营+其他+采购）', fen(opexTotal + purchTotal)),
+          stmtRow('折旧（摊销口径，按已录入流水计）', fen(depTotal)),
+          stmtRow('净利 = 收入 −（成本+费用+折旧）', fen(netProfit), { sum: true, tone: netProfit >= 0 ? 'ok' : 'err' }),
+        ],
+        note: '产品线未产生收入前此表为实算口径展示（Q42：每笔账强制原始凭证引用）。',
+      }),
+    ] }) : null,
+
+    view === 'cashflow' ? el(Card, { title: '现金流量表（收付实现制 · R-22）', children: [
+      el(Stmt, {
+        rows: [
+          stmtRow('经营活动现金流（收入 − 人力/场地/运营/其他）', fen(operFlow), { tone: operFlow >= 0 ? 'ok' : 'err' }),
+          stmtRow('投资活动现金流（采购+折旧摊销）', fen(investFlow), { tone: investFlow >= 0 ? 'ok' : 'err' }),
+          stmtRow('筹资活动现金流（未接入）', fen(0)),
+          stmtRow('净现金流（=期末现金余额）', fen(cash), { sum: true, tone: cash >= 0 ? 'ok' : 'err' }),
+        ],
+        note: '现阶段=经营流为主；折旧为摊销口径暂按已录入流水计，FUNC-21 折旧模块接入后自动按资产账计提。',
+      }),
+    ] }) : null,
+
+    view === 'balance' ? el(Card, { title: '资产负债表（INV-01：资产 = 负债 + 所有者权益）', children: [
+      el(Stmt, {
+        rows: [
+          stmtRow('货币资金（=累计净现金流）', fen(cash)),
+          stmtRow('应收账款（未接入）', fen(0)),
+          stmtRow('固定资产净值（资产账未接入，原值−累计折旧=0）', fen(0)),
+          stmtRow('资产合计', fen(cash), { sum: true }),
+          stmtRow('负债（未接入）', fen(0)),
+          stmtRow('所有者权益（OPC：峰哥一人）', fen(cash), { sum: true }),
+          stmtRow('恒等校验：资产 = 负债 + 权益 → ' + (Math.abs(cash - (0 + cash)) < 0.01 ? '通过 ✓' : '失配 ✗'), '', { dim: true }),
+        ],
+        note: 'INV-01 恒等校验当前恒通过（收付实现制下权益=现金）。固定资产台账与应收接入后自动带出净值。',
+      }),
+    ] }) : null,
+  ] })
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 6：运营面板（中枢运营=真数据聚合 · GEO119 产品运营=埋点未接入预留）
+// ══════════════════════════════════════════════════════════
+const ESC_OPEN_STATES = ['已执行', '默认项已执行', '已否决', '已关闭']
+
+function OpsPanel() {
+  const pending = useFetch(API + '/api/ledger/pending')
+  const wo = useFetch(API + '/api/ledger/workorders')
+  const esc = useFetch(API + '/api/ledger/escalations')
+  const search = useFetch(API + '/api/search')
+  const sentinel = useFetch(API + '/api/sentinel')
+  const patrol = useFetch(API + '/api/patrol')
+  const audit = useFetch(API + '/api/audit/weekly')
+
+  if (pending.loading || wo.loading || esc.loading || search.loading) return el(Load, {})
+  const firstErr = [pending, wo, esc, search].find(h => h.error)
+  if (firstErr) return el(ErrBox, { children: [firstErr.error], onRetry: () => [pending, wo, esc, search].forEach(h => h.refresh()) })
+
+  const s = (pending.data && pending.data.summary) || {}
+  const commitments = (pending.data && pending.data.commitments) || []
+  const overdueC = commitments.filter(c => c['截止日'] && c['截止日'] < today()).length
+  const wos = Array.isArray(wo.data) ? wo.data : []
+  const woActive = wos.filter(w => w.status === '进行中').length
+  const escAll = Array.isArray(esc.data) ? esc.data : []
+  const escOpen = escAll.filter(e => !ESC_OPEN_STATES.includes(e.status)).length
+  const entries = (search.data && search.data.entries) || []
+  const byModel = {}
+  for (const e of entries) { const k = String(e.model || '—').slice(0, 2).toUpperCase() || '—'; byModel[k] = (byModel[k] || 0) + 1 }
+
+  // 哨兵族数据
+  const tickerStates = (sentinel.data && sentinel.data.tickerStates) || {}
+  const tickerOk = Object.values(tickerStates).filter(v => v === 'ok').length
+  const tickerTotal = Object.keys(tickerStates).length
+  const stormAlerts = (sentinel.data && sentinel.data.stormAlerts) || 0
+  const patrolAlerts = (patrol.data && patrol.data.alerts) || []
+  const patrolAt = (patrol.data && patrol.data.lastSuccessAt) || '—'
+  const auditAt = (audit.data && audit.data.lastSuccessAt) || '—'
+  const sentinelAt = (sentinel.data && sentinel.data.heartbeatAt) || '—'
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['运营面板'] }),
+        el('div', { className: 'aod-sub', children: ['中枢运营=实时聚合（Q28 即时口径）· 哨兵族已暴露 · GEO119 产品运营=埋点未接入（Q43）'] }),
+      ] }),
+    ] }),
+
+    el('div', { className: 'aod-stats', children: [
+      el(Stat, { label: '悬决数', value: s.pendingCount || 0, tone: (s.pendingCount || 0) > 0 ? 'err' : 'ok' }),
+      el(Stat, { label: '未销号承诺（逾期' + overdueC + '）', value: commitments.length, tone: overdueC ? 'err' : 'ok' }),
+      el(Stat, { label: '升级单待决（总' + escAll.length + '）', value: escOpen }),
+      el(Stat, { label: '工单进行中（总' + wos.length + '）', value: woActive }),
+      el(Stat, { label: '本体条目', value: entries.length }),
+      el(Stat, { label: 'Ticker健康（' + tickerOk + '/' + tickerTotal + '）', value: tickerOk + '/' + tickerTotal, tone: tickerOk === tickerTotal ? 'ok' : 'err' }),
+    ] }),
+
+    el(Card, { title: '中枢运营读数（现有数据可接）', children: [
+      el(Tbl, {
+        cols: ['读数', '当前值', '口径说明'],
+        items: [
+          { key: 'p', onClick: null, cells: ['悬决数', s.pendingCount || 0, '未闭提案+未决升级单+未销号承诺（REP-01）'] },
+          { key: 'c', onClick: null, cells: ['承诺执行中 / 逾期', commitments.length + ' / ' + overdueC, 'COMMITMENTS.csv 未销号；逾期=截止日<今日（R-20 前置）'] },
+          { key: 'e', onClick: null, cells: ['升级单 待决 / 累计', escOpen + ' / ' + escAll.length, 'ESCALATIONS.jsonl；待决=未到四种闭环态'] },
+          { key: 'w', onClick: null, cells: ['工单 进行中 / 累计', woActive + ' / ' + wos.length, '本地 WORKORDERS.jsonl + paperclip 看板（Q45）双源'] },
+          { key: 'b', onClick: null, cells: ['本体覆盖度', entries.length + ' 条', Object.keys(byModel).map(k => k + ':' + byModel[k]).join(' · ') + '（Q-06，离线索引口径）'] },
+          { key: 'd1', onClick: null, cells: ['被打扰次数/周', el(Tag, { tone: 'mute', children: ['待建'] }), 'Q-02 口径；需从 ESCALATIONS.jsonl + operations_log 派生聚合（本轮未含）'] },
+          { key: 'd2', onClick: null, cells: ['升级配额使用率', el(Tag, { tone: 'mute', children: ['待建'] }), 'Q-04 口径；需配额账建立后带出（本轮未含）'] },
+        ],
+      }),
+      el('div', { className: 'aod-note', children: ['被打扰次数/周与升级配额使用率（Q-02/Q-04）显式标「待建」——无既有探针来源，不假装有数据。controller 周巡落周报快照为 Q28 另一半口径。'] }),
+    ] }),
+
+    el(Card, { title: '哨兵与巡逻（sentinel_v2 + patrol_hourly + weekly_audit）', children: [
+      el(Tbl, {
+        cols: ['探针族', '最后运行', '状态', '告警/摘要'],
+        items: [
+          { key: 's1', onClick: null, cells: [
+            'sentinel_v2（模型漂移+心跳+风暴熔断）',
+            fmtDT(sentinelAt),
+            el(Tag, { tone: tickerOk === tickerTotal && stormAlerts === 0 ? 'ok' : 'err', children: [tickerOk + '/' + tickerTotal + ' ok' + (stormAlerts ? ' · 风暴' + stormAlerts : '')] }),
+            stormAlerts ? (stormAlerts + ' 条风暴告警') : '无风暴',
+          ] },
+          { key: 's2', onClick: null, cells: [
+            'patrol_hourly（承诺逾期+对账日扫描）',
+            fmtDT(patrolAt),
+            el(Tag, { tone: patrolAlerts.length ? 'warn' : 'ok', children: [patrolAlerts.length ? patrolAlerts.length + ' 条告警' : '正常运行'] }),
+            patrolAlerts.length ? patrolAlerts[0].slice(0, 60) : '无告警',
+          ] },
+          { key: 's3', onClick: null, cells: [
+            'weekly_audit（周度审计快照）',
+            fmtDT(auditAt),
+            el(Tag, { tone: 'info', children: ['每周一执行'] }),
+            (audit.data && audit.data.latestReport) || '—',
+          ] },
+        ],
+      }),
+      el('div', { className: 'aod-note', children: ['三个探针族已在跑（sentinel_v2 每小时 / patrol_hourly 每小时 / weekly_audit 每周一），本轮新增只读端点暴露给面板——不新造探针。'] }),
+    ] }),
+
+    el(ProductMetricsCard, {}),
+  ] })
+}
+
+const METRIC_TYPES = ['VISITOR_IP', 'UV', 'REG_COUNT', 'REG_RATE', 'PAY_COUNT', 'PAY_RATE', 'REG_BTN_CTR', 'PAY_BTN_CTR']
+
+function ProductMetricsCard() {
+  const { data, loading, error, refresh } = useFetch(API + '/api/product-metrics')
+  const { busy, msg, run } = useAction()
+  const [showNew, setShowNew] = useState(false)
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error], onRetry: refresh })
+  const all = Array.isArray(data) ? data : []
+  // 按指标类型分组最新值
+  const latest = {}
+  for (const m of all) {
+    if (!latest[m.metricType] || (m.capturedAt || '') > (latest[m.metricType].capturedAt || '')) latest[m.metricType] = m
+  }
+  return el(Card, { title: '产品运营 · GEO119（埋点指标）', children: [
+    el('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+      el(Btn, { kind: 'pri', onClick: () => setShowNew(v => !v), children: [showNew ? '收起' : '+ 录入指标'] }),
+    ] }),
+    showNew ? el(ActionForm, {
+      title: '',
+      fields: [
+        { key: 'productLine', label: '产品线', default: 'GEO119' },
+        { key: 'metricType', label: '指标类型', type: 'select', options: METRIC_TYPES, default: 'UV' },
+        { key: 'value', label: '读数值', type: 'number', placeholder: '如 1234 或 0.15' },
+        { key: 'period', label: '统计期（YYYYMM）', default: today().slice(0, 7).replace('-', '') },
+      ],
+      submitLabel: '录入',
+      busy,
+      onSubmit: v => {
+        if (v.productLine && v.metricType && v.value) run('/api/action/product-metric', v, () => { setShowNew(false); refresh() })
+      },
+    }) : null,
+    el(Msg, { msg: msg }),
+    el(Tbl, {
+      cols: ['指标类型', '最新值', '产品线', '统计期', '采集时间'],
+      empty: '暂无产品运营指标 —— 埋点数据回传后自动入库',
+      items: METRIC_TYPES.map(mt => {
+        const m = latest[mt]
+        return {
+          key: mt,
+          onClick: null,
+          cells: [
+            mt,
+            m ? el(Tag, { tone: 'ok', children: [String(m.value)] }) : el(Tag, { tone: 'mute', children: ['无数据'] }),
+            m ? m.productLine : '—',
+            m ? m.period : '—',
+            m ? fmtDT(m.capturedAt) : '—',
+        ]}
+      }),
+    }),
+    el('div', { className: 'aod-note', children: ['指标类型照 M1 OBJ-21 DICT-METRIC-TYPE（8 项，含 PAY_COUNT 付费量）。埋点数据经 PC1 侧落地 → PC2 controller cron SSH 拉取（Q45 同构纪律）。'] }),
+  ] })
+}
+
+// ══════════════════════════════════════════════════════════
+// 面板 7：本体检索
+// ══════════════════════════════════════════════════════════
+function SearchPanel() {
+  const { data, loading, error } = useFetch(API + '/api/search')
+  const [q, setQ] = useState('')
+  const [sel, setSel] = useState(null)
+
+  if (loading) return el(Load, {})
+  if (error) return el(ErrBox, { children: [error] })
+
+  const entries = (data && data.entries) || []
+  const modelSet = new Set()
+  for (const e of entries) { const m = String(e.model || '').slice(0, 2).toUpperCase(); if (m) modelSet.add(m) }
+  const kw = q.trim().toLowerCase()
+  const hits = kw
+    ? entries.filter(e =>
+        ((e.id || '') + ' ' + (e.name || '') + ' ' + (e.description || '') + ' ' + (e.keywords || []).join(' ')).toLowerCase().includes(kw))
+    : entries
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['本体检索'] }),
+        el('div', { className: 'aod-sub', children: ['本体索引（v6 十一模型口径）· ' + entries.length + ' 条 · 覆盖 ' + modelSet.size + ' 模型 · 命中 ' + hits.length + ' 条'] }),
+      ] }),
+    ] }),
+    el('input', {
+      className: 'aod-search',
+      value: q,
+      onChange: e => setQ(e.target.value),
+      placeholder: '搜索对象 / 行为 / 规则 / 事件 / 场景 / 映射 / 接口，如「升级单」「销号」「GEO119」',
+    }),
+    el(Card, { title: '索引条目（点击行 → 详情）', children: [
+      el(Tbl, {
+        cols: ['ID', '名称', '模型', '领域', '说明'],
+        empty: '无命中条目',
+        items: hits.slice(0, 200).map(e => ({
+          key: e.id,
+          onClick: () => setSel(e),
+          cells: [
+            e.id,
+            e.name,
+            el(Tag, { tone: 'info', children: [e.model || '—'] }),
+            e.domain || '—',
+            (e.description || '').slice(0, 40) + ((e.description || '').length > 40 ? '…' : ''),
+          ],
+        })),
+      }),
+    ] }),
+    sel ? el(Drawer, {
+      title: sel.name,
+      subtitle: sel.id + ' · ' + (sel.model || ''),
+      onClose: () => setSel(null),
+      fields: [
+        ['ID', sel.id],
+        ['名称', sel.name],
+        ['模型', sel.model],
+        ['领域', sel.domain],
+        ['说明', sel.description],
+        ['关键词', (sel.keywords || []).join(' · ')],
+      ],
+      children: null,
+    }) : null,
+  ] })
+}
+
+// ══════════════════════════════════════════════════════════
+// 主页面 + 注册
+// ══════════════════════════════════════════════════════════
+const PANELS = {
+  pending: PendingPanel,
+  tasks: TaskPanel,
+  acceptance: AcceptancePanel,
+  ledger: CommitmentPanel,
+  finance: FinancePanel,
+  ops: OpsPanel,
+  search: SearchPanel,
+}
+
+function DeskHome() {
+  const [tab, setTab] = useState('pending')
+  const P = PANELS[tab] || PendingPanel
+  return el('div', { className: 'aod-page', children: [
+    el('div', { key: 'tabs', className: 'aod-tabs', children:
+      TABS.map(t => el('button', {
+        key: t.id,
+        className: 'aod-tab' + (t.id === tab ? ' on' : ''),
+        onClick: () => setTab(t.id),
+        children: [t.label],
+      })) }),
+    el(P, { key: 'panel-' + tab }),
+  ] })
+}
+
 function OfficeFloor() {
   const { data, error, isLoading, refetch } = useRoster()
   const turnBusy = useTurnBusy()
@@ -4866,10 +6238,12 @@ ${Object.entries(OFFICE_SKINS).map(([name, skin]) => skinCss(name, skin)).join('
 
 const plugin = {
   id: ID,
-  name: 'AMM OPC Office',
+  name: 'AMM OPC OS',
   register(ctx) {
     pluginCtx = ctx
     injectOfficeCss()
+    injectOsShellCss()
+    injectDeskCss()
 
     try {
       const seats = ctx.storage?.get?.('seats', null)
@@ -4928,13 +6302,13 @@ const plugin = {
       id: 'page',
       area: ROUTES_AREA,
       data: { path: '/office' },
-      render: () => jsx(OfficeFloor, {})
+      render: () => jsx(OsShell, {})
     })
 
     ctx.register({
       id: 'nav',
       area: SIDEBAR_NAV_AREA,
-      data: { path: '/office', label: 'AMM OPC Office', codicon: 'organization' }
+      data: { path: '/office', label: 'AMM OPC OS', codicon: 'organization' }
     })
 
     ctx.register({
@@ -4942,8 +6316,8 @@ const plugin = {
       area: PALETTE_AREA,
       data: {
         id: `${ID}.open`,
-        label: '打开办公室楼层',
-        keywords: ['机器人', '工位', '楼层', '办公室', '吧台', '跳房子'],
+        label: '打开 AMM OPC OS',
+        keywords: ['机器人', '工位', '楼层', '办公室', '吧台', '跳房子', 'desk', '指挥台', '悬决', '台账'],
         run: () => host.navigate('/office')
       }
     })
@@ -4960,6 +6334,7 @@ const plugin = {
 export default plugin
 
 export const __test = {
+  DeskHome, PendingPanel, TaskPanel, AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
   botHandle,
