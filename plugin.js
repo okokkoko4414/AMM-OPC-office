@@ -4349,6 +4349,25 @@ function osStartRoomFromProposal(p) {
   return room
 }
 
+// ══ PC1 远程团队横条（办公室页顶部，WP2）══
+// 数据源 /api/pc1/team（快照服务经 SSH 拉 PC1 hermes profile list，5 分钟缓存）
+// 诚实边界：running 仅表示 PC1 网关在线，不代表正在干活
+function Pc1TeamBar() {
+  const { data, loading } = useFetch(API + '/api/pc1/team')
+  const profiles = (data && data.profiles) || []
+  const unreachable = !loading && (!data || data.unreachable)
+  return jsxs('div', { className: 'pc1-team-bar', children: [
+    jsxs('span', { className: 'pc1-team-label', children: ['PC1 远程团队'] }),
+    unreachable ? jsxs('span', { className: 'pc1-team-down', children: ['不可达（SSH 断开）'] })
+      : loading ? jsxs('span', { className: 'pc1-team-dim', children: ['加载中…'] })
+      : profiles.map(p => jsxs('span', { key: p.name, className: 'pc1-team-chip', title: (p.model || '') + ' · ' + (p.status || ''), children: [
+          jsxs('i', { className: 'pc1-dot' + (p.status === 'running' ? ' on' : '') }),
+          jsxs('span', { children: [p.name] }),
+        ] })),
+    jsxs('span', { className: 'pc1-team-note', children: ['在线≠在干活'] }),
+  ] })
+}
+
 // ══ 群聊 UI ══
 function OsGroupChat() {
   const rooms = useValue($osRooms) || []
@@ -4526,7 +4545,7 @@ function OsShell() {
     ] }),
     view === 'deck' ? jsx(DeskHome, {})
       : view === 'chat' ? jsx(OsGroupChat, {})
-      : jsx(OfficeFloor, {}),
+      : jsxs(Fragment, { children: [jsx(Pc1TeamBar, {}), jsx(OfficeFloor, {})] }),
   ] })
 }
 
@@ -4580,6 +4599,15 @@ const OS_SHELL_CSS = `
 .osg-member-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;max-height:260px;overflow-y:auto;padding:4px;border:1px solid rgba(128,128,128,.2);border-radius:8px}
 .osg-member{display:flex;align-items:center;gap:6px;padding:5px 8px;border:1px solid rgba(128,128,128,.2);border-radius:6px;font-size:12px;cursor:pointer}
 .osg-member.on{border-color:#2f6feb;background:rgba(47,111,235,.12)}
+/* ── PC1 远程团队横条 ── */
+.pc1-team-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 12px;border-bottom:1px solid rgba(128,128,128,.2);background:rgba(127,127,127,.05);font-size:11.5px}
+.pc1-team-label{font-weight:600;opacity:.75;margin-right:4px}
+.pc1-team-chip{display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border:1px solid rgba(128,128,128,.25);border-radius:10px;opacity:.85}
+.pc1-dot{width:7px;height:7px;border-radius:50%;background:rgba(128,128,128,.5);display:inline-block}
+.pc1-dot.on{background:#3fb950}
+.pc1-team-down{color:#d29922}
+.pc1-team-dim{opacity:.55}
+.pc1-team-note{margin-left:auto;opacity:.45;font-size:10.5px}
 `
 function injectOsShellCss() {
   let el = document.getElementById('amm-os-shell-css')
