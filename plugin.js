@@ -4062,6 +4062,446 @@ function OfficeLife({ roster, jobs, activeProfile, turnBusy, roomRef }) {
 }
 
 
+// ══ AMM OPC OS 公司级群聊（合议引擎）══
+// 自研 per-member 轮转引擎（D1）：复刻 hermes-bots 原生模式，原语全是公开 RPC。
+// 数据存本插件 storage（命名空间 OS_ROOMS_KEY），与 hermes-bots 零冲突。
+// 公司级参数：成员上限 19（PC2 8 + PC1 11）、轮次可配 1~12 默认 6、手动续场、
+// @mention 定向、(pass) 沉默、水位增量投递、中断可恢复、日志滚动 retention。
+// 跨机成员（pc1/*）经快照服务 /api/action/a2a-send 同步代理（110s 窗回单句）。
+
+const OS_ROOMS_KEY = 'osRooms'
+const OS_MAX_MEMBERS = 19
+const OS_DEFAULT_ROUNDS = 6
+const OS_MAX_ROUNDS_LIMIT = 12
+const OS_LOG_LIMIT = 200          // 每房滚动 retention
+const OS_HISTORY_LINES = 24       // 注入协议时携带的新消息上限
+const OS_TURN_TIMEOUT_MS = 120000 // 成员发言超时
+const OS_RESUME_POLL_MS = 5000
+
+// ── 房间 atom 与持久化 ──
+const $osRooms = atom([])
+let osRoomsCtx = null
+function loadOsRooms(ctx) {
+  osRoomsCtx = ctx
+  try {
+    const saved = ctx.storage?.get?.(OS_ROOMS_KEY, null)
+    if (Array.isArray(saved)) $osRooms.set(saved)
+  } catch { /* no storage */ }
+}
+function saveOsRooms() {
+  try { osRoomsCtx?.storage?.set?.(OS_ROOMS_KEY, $osRooms.get()) } catch { /* no storage */ }
+}
+function getRoom(roomId) {
+  return ($osRooms.get() || []).find(r => r.roomId === roomId) || null
+}
+function patchRoom(roomId, patcher) {
+  const rooms = $osRooms.get().map(r => {
+    if (r.roomId !== roomId) return r
+    const next = typeof patcher === 'function' ? patcher({ ...r, engine: { ...(r.engine || {}) }, watermarks: { ...(r.watermarks || {}) }, sessions: { ...(r.sessions || {}) }, log: [...(r.log || [])], members: [...(r.members || [])] }) : { ...r, ...patcher }
+    next.lastActiveAt = Date.now()
+    return next
+  })
+  $osRooms.set(rooms)
+  saveOsRooms()
+}
+
+// ── 工具 ──
+function mintOsRoomId() {
+  return 'osr' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7)
+}
+function isOsPass(text) {
+  if (!text) return true
+  return /^\(?\s*pass\s*\)?\.?$/i.test(String(text).trim())
+}
+// @提及解析：匹配成员的 seat / label（含 pc1 前缀）；@everyone/@all/全体 → 全员
+function parseOsMentions(text, members) {
+  if (!text) return members.slice()
+  if (/@(everyone|all)\b|全体|大家/.test(text)) return members.slice()
+  const hits = []
+  for (const m of members) {
+    const keys = [m.seat, m.label, m.seat && m.seat.replace(/^pc1[/-]/, '')].filter(Boolean)
+    for (const k of keys) {
+      if (new RegExp('@' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(text)) { hits.push(m); break }
+      if (new RegExp('@' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=\\s|$|[^\\w-])', 'i').test(text)) { hits.push(m); break }
+    }
+  }
+  const seen = new Set(); const out = []
+  for (const m of hits) { if (!seen.has(m.key)) { seen.add(m.key); out.push(m) } }
+  return out.length ? out : members.slice()
+}
+// 水位增量：取该成员自上次发言后的新消息
+function osNewMessages(room, memberKey) {
+  const wm = (room.watermarks || {})[memberKey] || 0
+  return (room.log || []).slice(wm).slice(-OS_HISTORY_LINES)
+}
+// 群聊协议 prompt
+function buildOsTurnPrompt(room, member, newMsgs) {
+  const lines = newMsgs.map(m => {
+    const who = m.from.kind === 'user' ? '峰哥' : (m.from.label || m.from.seat)
+    return `  ${who}: ${m.text}`
+  }).join('\n')
+  return [
+    `[AMM OPC 合议群「${room.name}」] 你是 @${member.seat}（${member.label}），${member.machine === 'pc1' ? 'PC1 执行团队的智能体' : 'AMM 总经办席位'}，正在参与多智能体合议。`,
+    '',
+    '自你上次发言后的新消息（最早在前）：',
+    lines || '  （暂无）',
+    '',
+    '规则：① 直接面向议题，给出你职责视角的判断，简短（不超过 3 句）；',
+    '② 若你没有新增内容要补充，只回 `(pass)` 跳过，不要客套；',
+    '③ 要点名某位席位回应用 @席位代号；',
+    '④ 不要泄露你与我的任何私聊内容；',
+    '⑤ 每条发言力求可执行、可裁决，避免空话。',
+  ].join('\n')
+}
+
+// ── PC2 成员会话管理（懒创建隐藏房间会话，复用 office 的 requestForBot 路由）──
+async function ensureOsSession(member, roomId) {
+  const room = getRoom(roomId)
+  const existing = room && room.sessions && room.sessions[member.key]
+  if (existing) {
+    try {
+      const r = await requestForBot(member, 'session.resume', { session_id: existing })
+      if (r && (r.runtime || r.session_id || r.id)) return { stored: existing, runtime: r.runtime || r.session_id || r.id }
+    } catch (e) {
+      if (!/4007/.test(String(e && e.message))) throw e // 4007=会话不存在，重建；其余 fail-closed
+    }
+  }
+  const created = await requestForBot(member, 'session.create', {
+    profile: member.name, title: 'OS-Group: ' + roomId, hidden: true, room_plumbing: true, follow_profile_config: true,
+  })
+  const sid = created && (created.session_id || created.id || (created.session && created.session.id))
+  patchRoom(roomId, r => { r.sessions[member.key] = sid; return r })
+  return { stored: sid, runtime: (created && created.runtime) || sid }
+}
+
+// ── 等成员发言完成：message.complete 事件 + resume 轮询兜底 ──
+const osTurnWaiters = new Map() // sessionKey -> {resolve, baseline, memberKey, roomId}
+function osHandleGatewayEvent(ev) {
+  if (!ev || !ev.type) return
+  if (ev.type !== 'message.complete' && ev.type !== 'message.error') return
+  const sid = ev.session_id || (ev.payload && ev.payload.session_id)
+  if (!sid) return
+  if (typeof process !== 'undefined' && process.env && process.env.OSG_DEBUG) {
+    console.error('[osHandle]', sid, ev.type, 'waiters=', [...osTurnWaiters.keys()].join(','))
+  }
+  for (const [key, w] of osTurnWaiters) {
+    if (key === String(sid)) {
+      if (ev.type === 'message.complete') w.resolve({ ok: true, text: (ev.payload && (ev.payload.text || ev.payload.reply)) || '' })
+      else w.resolve({ ok: false, error: (ev.payload && ev.payload.error) || 'message.error' })
+    }
+  }
+}
+async function waitOsTurn(member, roomId, sessionIds, baselineCount) {
+  return new Promise(async (resolve) => {
+    const key = String(sessionIds.runtime)
+    const waiter = { resolve: (res) => { osTurnWaiters.delete(key); finish(res) } }
+    osTurnWaiters.set(key, waiter)
+    let done = false
+    const finish = (res) => { if (done) return; done = true; clearInterval(poll); clearTimeout(to); resolve(res) }
+    const poll = setInterval(async () => {
+      try {
+        const r = await requestForBot(member, 'session.resume', { session_id: sessionIds.stored })
+        const msgs = (r && (r.messages || r.history)) || []
+        const fresh = msgs.slice(baselineCount)
+        const lastAssistant = [...fresh].reverse().find(m => m && (m.role === 'assistant' || m.kind === 'assistant') && (m.text || m.content))
+        if (lastAssistant) finish({ ok: true, text: lastAssistant.text || lastAssistant.content })
+      } catch { /* 继续轮询 */ }
+    }, OS_RESUME_POLL_MS)
+    const to = setTimeout(() => finish({ ok: false, error: 'timeout' }), OS_TURN_TIMEOUT_MS)
+  })
+}
+
+// ── 给单个成员投递一轮发言并取回复 ──
+async function osMemberSpeak(roomId, member) {
+  const room = getRoom(roomId)
+  if (!room) return { ok: false, error: 'room gone' }
+  const newMsgs = osNewMessages(room, member.key)
+  const prompt = buildOsTurnPrompt(room, member, newMsgs)
+  patchRoom(roomId, r => { r.engine.currentSeat = member.seat; return r })
+
+  if (member.machine === 'pc1') {
+    // 跨机：A2A 同步代理（110s 内回单句），天然匹配轮转单句协议
+    try {
+      const resp = await fetch(API + '/api/action/a2a-send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: `[给 @${member.seat}] ` + prompt }),
+      }).then(r => r.json())
+      const text = resp && (resp.reply || resp.text || '')
+      if (resp && resp.ok === false) return { ok: false, error: resp.error || 'a2a failed' }
+      return { ok: true, text: String(text || '').slice(0, 800) }
+    } catch (e) { return { ok: false, error: String(e && e.message || e) } }
+  }
+
+  // PC2：隐藏房间会话
+  try {
+    const sess = await ensureOsSession(member, roomId)
+    const resume0 = await requestForBot(member, 'session.resume', { session_id: sess.stored }).catch(() => null)
+    const baseline = ((resume0 && (resume0.messages || resume0.history)) || []).length
+    return await withBotLease(member, async () => {
+      await requestForBot(member, 'prompt.submit', { session_id: sess.runtime, text: prompt })
+      const res = await waitOsTurn(member, roomId, sess, baseline)
+      return res.ok ? { ok: true, text: String(res.text || '').slice(0, 1200) } : { ok: false, error: res.error || 'no reply' }
+    })
+  } catch (e) { return { ok: false, error: String(e && e.message || e) } }
+}
+
+// ── 轮转引擎主循环 ──
+const osRunning = new Set() // roomId 防重入
+async function runOsRounds(roomId, opts) {
+  if (osRunning.has(roomId)) return
+  osRunning.add(roomId)
+  const extraRounds = (opts && opts.extraRounds) || 0
+  try {
+    let room = getRoom(roomId)
+    if (!room) return
+    const startRound = (room.engine && room.engine.round) || 0
+    const maxRounds = Math.min((room.maxRounds || OS_DEFAULT_ROUNDS) + extraRounds, OS_MAX_ROUNDS_LIMIT * 2)
+    patchRoom(roomId, r => { r.engine.running = true; r.engine.settled = false; r.engine.epoch = (r.engine.epoch || 0) + 1; return r })
+    const epoch = (getRoom(roomId).engine || {}).epoch
+
+    let anySpokeThisEpoch = false
+    for (let round = startRound; round < maxRounds; round++) {
+      room = getRoom(roomId)
+      if (!room || !room.engine || !room.engine.running) break      // 被 stop
+      if ((room.engine.epoch || 0) !== epoch) break                 // 新一轮已接管
+      patchRoom(roomId, r => { r.engine.round = round; return r })
+
+      const lastUserMsg = [...(room.log || [])].reverse().find(m => m.from.kind === 'user')
+      const responders = parseOsMentions(lastUserMsg ? lastUserMsg.text : '', room.members || [])
+      if (!responders.length) break
+
+      let spokeInRound = 0
+      for (const member of responders) {
+        room = getRoom(roomId)
+        if (!room || !room.engine || !room.engine.running || (room.engine.epoch || 0) !== epoch) break
+        const res = await osMemberSpeak(roomId, member)
+        // 推水位（无论 pass 与否，该成员已读到当前 log 末尾）
+        patchRoom(roomId, r => { r.watermarks[member.key] = (r.log || []).length; return r })
+        if (res.ok && !isOsPass(res.text)) {
+          appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, text: res.text, round })
+          spokeInRound++
+          anySpokeThisEpoch = true
+        } else if (!res.ok) {
+          appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, text: '（发言失败：' + (res.error || '未知') + '）', round, sys: true })
+        }
+      }
+      if (spokeInRound === 0) break  // 全员 pass → 提前 settled
+    }
+    patchRoom(roomId, r => { r.engine.running = false; r.engine.settled = true; r.engine.currentSeat = null; return r })
+    try { host.notify && host.notify(`合议「${(getRoom(roomId) || {}).name || roomId}」已落定`) } catch {}
+  } finally {
+    osRunning.delete(roomId)
+  }
+}
+function stopOsRounds(roomId) {
+  patchRoom(roomId, r => { r.engine.running = false; r.engine.settled = true; r.engine.currentSeat = null; return r })
+}
+function appendOsLog(roomId, msg) {
+  patchRoom(roomId, r => {
+    const log = [...(r.log || []), { id: 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), at: Date.now(), ...msg }]
+    r.log = log.length > OS_LOG_LIMIT ? log.slice(log.length - OS_LOG_LIMIT) : log  // retention
+    return r
+  })
+}
+
+// ── 创建 / 发送 ──
+function createOsRoom({ name, members, maxRounds }) {
+  const room = {
+    roomId: mintOsRoomId(), name: name || '合议 ' + new Date().toLocaleDateString('zh-CN'),
+    members: members.slice(0, OS_MAX_MEMBERS), maxRounds: Math.max(1, Math.min(maxRounds || OS_DEFAULT_ROUNDS, OS_MAX_ROUNDS_LIMIT)),
+    log: [], watermarks: {}, sessions: {}, engine: { epoch: 0, running: false, settled: false, round: 0, currentSeat: null },
+    createdAt: Date.now(), lastActiveAt: Date.now(),
+  }
+  $osRooms.set([...(($osRooms.get() || [])), room])
+  saveOsRooms()
+  return room
+}
+function sendOsUserMessage(roomId, text) {
+  appendOsLog(roomId, { from: { kind: 'user', seat: 'boss', label: '峰哥' }, text })
+  runOsRounds(roomId)
+}
+
+// ── 合议与台账打通 ──
+function osConcludeToProposal(roomId) {
+  const room = getRoom(roomId)
+  if (!room) return null
+  const memberMsgs = (room.log || []).filter(m => m.from.kind === 'member' && !m.sys)
+  const summary = memberMsgs.slice(-8).map(m => `@${m.from.seat}: ${m.text}`).join('\n')
+  return {
+    title: '合议结论：' + room.name,
+    targetAnchor: '合议群 ' + room.roomId,
+    proposerSeat: 'ceo',
+    priority: 'P2',
+    fiveItems: summary.slice(0, 1500),
+  }
+}
+
+// 从提案/工单一键发起合议（悬决面板/任务面板「发起合议」按钮调用）
+// 成员默认总经办 8 席（SEATS），议题=事项内容，切到群聊视图并启动轮转
+function osStartRoomFromProposal(p) {
+  const members = SEATS.map(s => ({ key: 'pc2:' + s, name: s, seat: s, label: s, machine: 'pc2' }))
+  const title = p.title || p['事项'] || p.proposalId || p.workOrderId || '未命名事项'
+  const anchor = p.targetAnchor || p['出处文件'] || ''
+  const room = createOsRoom({ name: '合议：' + title, members, maxRounds: OS_DEFAULT_ROUNDS })
+  appendOsLog(room.roomId, { from: { kind: 'user', seat: 'boss', label: '峰哥' }, text: '【合议议题】' + title + (anchor ? '\n依据/目标锚：' + anchor : '') + '\n请各位从职责视角给出裁决建议（无补充可回 (pass)）。' })
+  try { $view.set('chat') } catch { /* 视图切换失败不阻塞合议 */ }
+  runOsRounds(room.roomId)
+  return room
+}
+
+// ══ 群聊 UI ══
+function OsGroupChat() {
+  const rooms = useValue($osRooms) || []
+  const [activeId, setActiveId] = useState(null)
+  const [showCreate, setShowCreate] = useState(false)
+  const active = rooms.find(r => r.roomId === activeId) || null
+
+  return jsxs('div', { className: 'osg-wrap', children: [
+    jsxs('div', { className: 'osg-side', children: [
+      jsxs('div', { className: 'osg-side-head', children: [
+        jsx('span', { children: ['合议群'] }),
+        jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: () => setShowCreate(true), children: ['+ 发起合议'] }),
+      ] }),
+      jsxs('div', { className: 'osg-room-list', children: [
+        rooms.length === 0 ? jsxs('div', { className: 'osg-empty', children: ['还没有合议群。点上方「+ 发起合议」创建。'] }) : null,
+        ...rooms.map(r => jsxs('button', {
+          key: r.roomId,
+          className: 'osg-room-item' + (activeId === r.roomId ? ' on' : ''),
+          onClick: () => setActiveId(r.roomId),
+          children: [
+            jsxs('div', { className: 'osg-room-name', children: [r.name] }),
+            jsxs('div', { className: 'osg-room-meta', children: [
+              r.members.length + ' 席 · ' + (r.log || []).length + ' 条 · ',
+              r.engine && r.engine.running ? jsxs('span', { className: 'osg-live', children: ['● 第 ' + ((r.engine.round || 0) + 1) + ' 轮 '] }) : null,
+              r.engine && r.engine.settled ? jsx('span', { className: 'osg-settled', children: ['已落定'] }) : null,
+            ] }),
+          ],
+        })),
+      ] }),
+    ] }),
+    jsxs('div', { className: 'osg-main', children: [
+      active ? jsx(OsRoomView, { room: active }) : jsxs('div', { className: 'osg-empty', style: { paddingTop: 80 }, children: ['选择左侧合议群，或发起新合议。'] }),
+    ] }),
+    showCreate ? jsx(OsCreateRoomDialog, { onClose: () => setShowCreate(false), onCreated: (room) => { setShowCreate(false); setActiveId(room.roomId) } }) : null,
+  ] })
+}
+
+function OsRoomView({ room }) {
+  const [draft, setDraft] = useState('')
+  const listRef = useRef(null)
+  const log = room.log || []
+  useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight }, [log.length])
+  const eng = room.engine || {}
+
+  const send = () => {
+    const t = draft.trim()
+    if (!t) return
+    setDraft('')
+    sendOsUserMessage(room.roomId, t)
+  }
+  const conclude = async () => {
+    const payload = osConcludeToProposal(room.roomId)
+    if (!payload) return
+    await fetch(API + '/api/action/proposal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).then(r => r.json()).catch(() => null)
+    try { host.notify && host.notify('已把合议结论登记为提案') } catch {}
+  }
+
+  return jsxs('div', { className: 'osg-room', children: [
+    jsxs('div', { className: 'osg-room-head', children: [
+      jsxs('div', { children: [
+        jsxs('div', { className: 'osg-room-title', children: [room.name] }),
+        jsxs('div', { className: 'osg-room-sub', children: [
+          room.members.map(m => m.label).join(' · '),
+          '　｜　轮次上限 ' + (room.maxRounds || OS_DEFAULT_ROUNDS),
+        ] }),
+      ] }),
+      jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+        eng.running ? jsxs('button', { className: 'aod-btn aod-btn-danger', onClick: () => stopOsRounds(room.roomId), children: ['停止'] }) : null,
+        eng.settled && !eng.running ? jsxs(Fragment, { children: [
+          jsxs('button', { className: 'aod-btn', onClick: () => runOsRounds(room.roomId, { extraRounds: 3 }), children: ['+3 轮续场'] }),
+          jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: conclude, children: ['登记结论为提案'] }),
+        ] }) : null,
+      ] }),
+    ] }),
+    eng.running ? jsxs('div', { className: 'osg-progress', children: [
+      '正在合议：第 ' + ((eng.round || 0) + 1) + ' 轮' + (eng.currentSeat ? ' · @' + eng.currentSeat + ' 发言中…' : ''),
+    ] }) : null,
+    jsxs('div', { className: 'osg-log', ref: listRef, children: [
+      log.length === 0 ? jsxs('div', { className: 'osg-empty', children: ['在下方输入议题，@席位可定向点名（如 @ceo @beta）。'] }) : null,
+      ...log.map(m => {
+        const isUser = m.from.kind === 'user'
+        return jsxs('div', { className: 'osg-msg' + (isUser ? ' user' : '') + (m.sys ? ' sys' : ''), children: [
+          jsxs('div', { className: 'osg-msg-head', children: [
+            jsxs('span', { className: 'osg-msg-who', children: [isUser ? '峰哥' : (m.from.label || m.from.seat)] }),
+            jsxs('span', { className: 'osg-msg-at', children: [new Date(m.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })] }),
+          ] }),
+          jsxs('div', { className: 'osg-msg-text', children: [m.text] }),
+        ] }, m.id)
+      }),
+    ] }),
+    jsxs('div', { className: 'osg-input', children: [
+      jsx('input', {
+        value: draft, placeholder: '输入议题或指令…（@席位 点名；无点名则全员轮流发言）',
+        onChange: e => setDraft(e.target.value),
+        onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } },
+      }),
+      jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: send, children: ['发送'] }),
+    ] }),
+  ] })
+}
+
+function OsCreateRoomDialog({ onClose, onCreated }) {
+  const rosterQuery = useRoster()
+  const pc1 = useFetch(API + '/api/pc1/team')
+  const [name, setName] = useState('')
+  const [rounds, setRounds] = useState(OS_DEFAULT_ROUNDS)
+  const [sel, setSel] = useState({})
+
+  const profiles = (rosterQuery && rosterQuery.data && rosterQuery.data.profiles) || []
+  const pc2Members = profiles.filter(p => p && p.name).map(p => ({ key: 'pc2:' + p.name, name: p.name, seat: p.name, label: p.title || p.name, machine: 'pc2' }))
+  const pc1Members = ((pc1.data && pc1.data.profiles) || []).map(p => ({ key: 'pc1:' + p.name, seat: 'pc1/' + p.name, label: 'PC1·' + (p.alias || p.name), machine: 'pc1' }))
+  const all = [...pc2Members, ...pc1Members]
+  const chosen = all.filter(m => sel[m.key])
+
+  const toggle = (k) => setSel(s => ({ ...s, [k]: !s[k] }))
+  const selectDefault = () => { const o = {}; for (const m of pc2Members.slice(0, 8)) o[m.key] = true; setSel(o) }
+
+  const create = () => {
+    if (!chosen.length) return
+    const room = createOsRoom({ name: name.trim(), members: chosen, maxRounds: rounds })
+    onCreated(room)
+  }
+
+  return jsxs('div', { className: 'osg-mask', onClick: onClose, children: [
+    jsxs('div', { className: 'osg-dialog', onClick: e => e.stopPropagation(), children: [
+      jsxs('div', { className: 'osg-dialog-title', children: ['发起合议'] }),
+      jsxs('label', { className: 'osg-field', children: [
+        jsx('span', { children: ['合议主题'] }),
+        jsx('input', { value: name, onChange: e => setName(e.target.value), placeholder: '如：GEO119 诊断方案评审' }),
+      ] }),
+      jsxs('label', { className: 'osg-field', children: [
+        jsxs('span', { children: ['轮次上限（默认 6，最多 ', OS_MAX_ROUNDS_LIMIT, '）'] }),
+        jsx('input', { type: 'number', min: 1, max: OS_MAX_ROUNDS_LIMIT, value: rounds, onChange: e => setRounds(Math.max(1, Math.min(parseInt(e.target.value || '6', 10) || 6, OS_MAX_ROUNDS_LIMIT))) }),
+      ] }),
+      jsxs('div', { className: 'osg-field', children: [
+        jsxs('div', { className: 'osg-field-head', children: [
+          jsxs('span', { children: ['选择成员（已选 ', chosen.length, ' / 上限 ', OS_MAX_MEMBERS, '）'] }),
+          jsxs('button', { className: 'aod-btn', onClick: selectDefault, children: ['总经办 8 席'] }),
+        ] }),
+        jsxs('div', { className: 'osg-member-grid', children: all.map(m => jsxs('label', { className: 'osg-member' + (sel[m.key] ? ' on' : ''), children: [
+          jsx('input', { type: 'checkbox', checked: !!sel[m.key], onChange: () => toggle(m.key) }),
+          jsxs('span', { children: [m.label] }),
+        ] }, m.key)) }),
+      ] }),
+      jsxs('div', { className: 'aod-btnrow', children: [
+        jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: create, disabled: !chosen.length, children: ['创建并开始'] }),
+        jsxs('button', { className: 'aod-btn', onClick: onClose, children: ['取消'] }),
+      ] }),
+    ] }),
+  ] })
+}
+
+
 // ══ AMM OPC OS 视图壳（办公室 / 指挥台 / 群聊）══
 const $view = atom('office')
 function OsShell() {
@@ -4085,10 +4525,7 @@ function OsShell() {
       }),
     ] }),
     view === 'deck' ? jsx(DeskHome, {})
-      : view === 'chat' ? jsxs('div', { className: 'amm-os-chatph', children: [
-          jsxs('div', { className: 'amm-os-chatph-t', children: ['群聊（合议）'] }),
-          jsxs('div', { className: 'amm-os-chatph-d', children: ['公司级多智能体合议群聊，WP4 开发中。当前请用原生 Bot Mode 群聊。'] }),
-        ] })
+      : view === 'chat' ? jsx(OsGroupChat, {})
       : jsx(OfficeFloor, {}),
   ] })
 }
@@ -4103,6 +4540,46 @@ const OS_SHELL_CSS = `
 .amm-os-chatph{padding:60px 30px;text-align:center;opacity:.75}
 .amm-os-chatph-t{font-size:18px;font-weight:700;margin-bottom:10px}
 .amm-os-chatph-d{font-size:13px;line-height:1.7}
+
+/* ── 群聊（合议）样式 ── */
+.osg-wrap{display:flex;gap:0;height:calc(100vh - 120px);min-height:420px;border:1px solid rgba(128,128,128,.25);border-radius:8px;overflow:hidden}
+.osg-side{width:240px;flex:none;border-right:1px solid rgba(128,128,128,.25);display:flex;flex-direction:column;background:rgba(127,127,127,.04)}
+.osg-side-head{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(128,128,128,.2);font-weight:600}
+.osg-room-list{flex:1;overflow-y:auto}
+.osg-room-item{display:block;width:100%;text-align:left;padding:10px 12px;border:none;border-bottom:1px solid rgba(128,128,128,.12);background:none;color:inherit;cursor:pointer}
+.osg-room-item.on{background:rgba(88,166,255,.12)}
+.osg-room-name{font-weight:600;font-size:13px}
+.osg-room-meta{font-size:11px;opacity:.65;margin-top:2px}
+.osg-live{color:#3fb950}
+.osg-settled{opacity:.7}
+.osg-main{flex:1;display:flex;flex-direction:column;min-width:0}
+.osg-empty{padding:30px;text-align:center;opacity:.55;font-size:13px}
+.osg-room{display:flex;flex-direction:column;height:100%}
+.osg-room-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:12px 14px;border-bottom:1px solid rgba(128,128,128,.2)}
+.osg-room-title{font-weight:700;font-size:14px}
+.osg-room-sub{font-size:11.5px;opacity:.6;margin-top:2px}
+.osg-progress{padding:6px 14px;font-size:12px;color:#58a6ff;border-bottom:1px solid rgba(128,128,128,.15);background:rgba(88,166,255,.06)}
+.osg-log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.osg-msg{max-width:78%;align-self:flex-start}
+.osg-msg.user{align-self:flex-end}
+.osg-msg.sys{opacity:.6}
+.osg-msg-head{display:flex;gap:8px;align-items:baseline;margin-bottom:2px}
+.osg-msg-who{font-size:11.5px;font-weight:600;opacity:.8}
+.osg-msg-at{font-size:10px;opacity:.5}
+.osg-msg-text{padding:8px 12px;border-radius:10px;background:rgba(127,127,127,.12);font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.osg-msg.user .osg-msg-text{background:#2f6feb;color:#fff}
+.osg-input{display:flex;gap:8px;padding:12px 14px;border-top:1px solid rgba(128,128,128,.2)}
+.osg-input input{flex:1;padding:8px 12px;border:1px solid rgba(128,128,128,.4);border-radius:8px;background:rgba(127,127,127,.08);color:inherit;font-size:13px}
+.osg-mask{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:950;display:flex;align-items:center;justify-content:center}
+.osg-dialog{width:520px;max-width:94vw;max-height:88vh;overflow-y:auto;background:#1e1e22;border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:18px;color:#e6e6e6}
+.osg-dialog-title{font-weight:700;font-size:15px;margin-bottom:14px}
+.osg-field{display:block;margin-bottom:14px}
+.osg-field>span{display:block;font-size:11.5px;opacity:.65;margin-bottom:4px}
+.osg-field input{width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid rgba(128,128,128,.4);border-radius:6px;background:rgba(127,127,127,.08);color:inherit;font-size:13px}
+.osg-field-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.osg-member-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;max-height:260px;overflow-y:auto;padding:4px;border:1px solid rgba(128,128,128,.2);border-radius:8px}
+.osg-member{display:flex;align-items:center;gap:6px;padding:5px 8px;border:1px solid rgba(128,128,128,.2);border-radius:6px;font-size:12px;cursor:pointer}
+.osg-member.on{border-color:#2f6feb;background:rgba(47,111,235,.12)}
 `
 function injectOsShellCss() {
   let el = document.getElementById('amm-os-shell-css')
@@ -4530,6 +5007,9 @@ function ProposalDrawer({ p, busy, msg, run, onDone, onClose }) {
       p.currentStage !== '已裁定' && p.currentStage !== '已废止' ? el('div', { className: 'aod-btnrow', children: [
         el(Btn, { kind: 'danger', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: p.proposalId, newStage: '已废止' }, onDone), children: ['废止提案'] }),
       ] }) : null,
+      el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { onClick: () => { try { osStartRoomFromProposal(p); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['发起合议（8 席）'] }),
+      ] }),
       el(Msg, { msg: msg }),
     ] }),
   })
@@ -4759,14 +5239,19 @@ function KanbanDetailDrawer({ t, busy, msg, run, onDone, onClose }) {
       ['更新于', t.updatedAt ? t.updatedAt.slice(0, 16).replace('T', ' ') : '—'],
       ['数据源', isPaperclip ? 'paperclip（经 SSH+psql 只读拉取）' : '本地 WORKORDERS.jsonl'],
     ],
-    children: !isPaperclip && (t.status === 'EXECUTING' || t.status === '进行中') ? el(ActionForm, {
-      title: '终止工单（Q4 裁定：峰哥有终止权）',
-      fields: [{ key: 'terminateReason', label: '终止原因', placeholder: '必填' }],
-      submitLabel: '确认终止',
-      busy,
-      onSubmit: v => { if (v.terminateReason) run('/api/action/terminate-workorder', { workOrderId: t.workOrderId, terminateReason: v.terminateReason, terminatedBy: '峰哥' }, onDone) },
-    }) : el('div', { className: 'aod-note', children: [
-      isPaperclip ? 'paperclip 工单的状态变更在 PC1 paperclip 侧操作，决策中枢只读。' : '此工单当前状态不支持操作。',
+    children: el(Fragment, { children: [
+      !isPaperclip && (t.status === 'EXECUTING' || t.status === '进行中') ? el(ActionForm, {
+        title: '终止工单（Q4 裁定：峰哥有终止权）',
+        fields: [{ key: 'terminateReason', label: '终止原因', placeholder: '必填' }],
+        submitLabel: '确认终止',
+        busy,
+        onSubmit: v => { if (v.terminateReason) run('/api/action/terminate-workorder', { workOrderId: t.workOrderId, terminateReason: v.terminateReason, terminatedBy: '峰哥' }, onDone) },
+      }) : el('div', { className: 'aod-note', children: [
+        isPaperclip ? 'paperclip 工单的状态变更在 PC1 paperclip 侧操作，决策中枢只读。' : '此工单当前状态不支持操作。',
+      ] }),
+      el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { onClick: () => { try { osStartRoomFromProposal(t); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['发起合议（8 席）'] }),
+      ] }),
     ] }),
   })
 }
@@ -6244,6 +6729,7 @@ const plugin = {
     injectOfficeCss()
     injectOsShellCss()
     injectDeskCss()
+    loadOsRooms(ctx)
 
     try {
       const seats = ctx.storage?.get?.('seats', null)
@@ -6278,8 +6764,9 @@ const plugin = {
     }
 
     let stopEvents = null
+    let stopOsEvents = null
     try {
-      if (typeof host.onEvent === 'function') stopEvents = host.onEvent('*', handleJobEvent)
+      if (typeof host.onEvent === 'function') { stopEvents = host.onEvent('*', handleJobEvent); stopOsEvents = host.onEvent('*', osHandleGatewayEvent) }
     } catch {
       /* older shell */
     }
@@ -6287,6 +6774,8 @@ const plugin = {
       ctx.onDispose?.(() => {
         stopEvents?.()
         stopEvents = null
+        stopOsEvents?.()
+        stopOsEvents = null
         // Stop transport work without deleting persisted records. A plugin
         // unload/reload must leave accepted tasks recoverable.
         for (const { timer } of jobPollers.values()) clearInterval(timer)
@@ -6334,7 +6823,9 @@ const plugin = {
 export default plugin
 
 export const __test = {
-  DeskHome, PendingPanel, TaskPanel, AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
+  DeskHome, PendingPanel, TaskPanel,
+  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat,
+ AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
   botHandle,
