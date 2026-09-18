@@ -3664,14 +3664,32 @@ function TaskBar({ roster, activeProfile }) {
     },
     children: [
       jsx(BotPicker, { roster, bot, look }),
+      jsx('button', {
+        type: 'button',
+        className: 'office-task-attach',
+        title: '上传附件（图片 / 文件，随消息一并发送）',
+        onClick: () => { void osPickAttachment(bot, setText) },
+        children: '📎'
+      }),
       jsx('input', {
         ref: inputRef,
         className: cn('office-task-input', job?.state === JOB_STATES.FAILED && 'is-failed'),
         value: text,
-        placeholder: sending ? `${look.title} 正在处理…` : job?.state === JOB_STATES.FAILED ? '检查失败的任务并重试…' : `告诉 ${look.title}…`,
+        placeholder: sending ? `${look.title} 正在处理…` : job?.state === JOB_STATES.FAILED ? '检查失败的任务并重试…' : `告诉 ${look.title}…（/ 命令 · 📎 附件）`,
         disabled: busy || sending || unknown,
         'aria-describedby': job?.error ? 'office-task-status' : undefined,
-        onChange: event => setText(event.target.value)
+        onChange: event => {
+          setText(event.target.value)
+          const rosterMembers = roster.map(r => ({ key: r.name, name: r.name, seat: r.name, label: (botLook(r) || {}).title || r.name, machine: 'pc2' }))
+          osAssistOnChange(event.target.value, event.target, v => setText(v), rosterMembers, item => {
+            pickBot(item.name)
+            const elx = inputRef.current
+            const caret2 = elx && elx.selectionStart != null ? elx.selectionStart : event.target.value.length
+            const at2 = event.target.value.lastIndexOf('@', caret2)
+            if (at2 >= 0) setText(event.target.value.slice(0, at2) + event.target.value.slice(caret2))
+          })
+        },
+        onKeyDown: event => osAssistOnKey(event)
       }),
       unknown
         ? jsxs(Fragment, { children: [
@@ -3694,7 +3712,8 @@ function TaskBar({ roster, activeProfile }) {
             disabled: busy || sending || !text.trim(),
             children: sending ? '处理中' : job?.state === JOB_STATES.FAILED ? '重试' : '发送'
           }),
-      job?.error ? jsx('span', { id: 'office-task-status', className: 'office-task-status', role: 'status', children: job.error }) : null
+      job?.error ? jsx('span', { id: 'office-task-status', className: 'office-task-status', role: 'status', children: job.error }) : null,
+      jsx(OsAssistLayer, {})
     ]
   })
 }
@@ -4386,7 +4405,149 @@ function Pc1TeamBar() {
   ] })
 }
 
-// ══ 群聊 UI ══
+// ══ 输入助手（群聊 + 办公室 TaskBar 共用）══
+// @提及补全 + / 命令面板 + 附件 attach 流
+// 命令清单来自 hermes 源码（gateway/slash_commands* + desktop-slash-commands）：
+// 插件输入框经 prompt.submit 透传 → agent 侧命令有效；桌面专属命令（/yolo /skin 等）不透传，不列入
+const OS_SLASH_COMMANDS = [
+  { cmd: '/compact', desc: '压缩当前会话上下文（上下文过长时用）' },
+  { cmd: '/new', desc: '重置会话上下文（开新工作段）' },
+  { cmd: '/status', desc: '查看当前会话状态' },
+  { cmd: '/goal', desc: '设置 / 查看当前目标' },
+  { cmd: '/model', desc: '切换本会话模型' },
+  { cmd: '/memory', desc: '查看 / 管理长期记忆' },
+  { cmd: '/skills', desc: '查看 / 管理技能' },
+  { cmd: '/approvals', desc: '查看待审批项' },
+  { cmd: '/rollback', desc: '回滚最近的文件改动' },
+  { cmd: '/diff', desc: '查看改动 diff' },
+  { cmd: '/busy', desc: '忙碌策略：queue / steer / interrupt' },
+  { cmd: '/help', desc: '查看帮助' },
+]
+
+const $assist = atom(null) // {kind:'mention'|'slash', query, items, hli, apply, inputEl}
+const $osAttach = atom(null) // {label, refText}
+
+function osAssistClose() { $assist.set(null) }
+
+// onChange 检测：光标前的 @token（提及）或起始 /token（命令）
+function osAssistOnChange(text, inputEl, apply, members, onPick) {
+  try {
+    const caret = inputEl.selectionStart != null ? inputEl.selectionStart : text.length
+    const before = text.slice(0, caret)
+    // / 命令：必须是消息开头
+    const slashM = /^\/([\w-]*)$/.exec(before)
+    if (slashM) {
+      const q = slashM[1].toLowerCase()
+      const items = OS_SLASH_COMMANDS.filter(c => c.cmd.toLowerCase().startsWith('/' + q))
+      if (items.length) {
+        $assist.set({ kind: 'slash', query: slashM[0], items, hli: 0, apply, inputEl })
+        return
+      }
+      osAssistClose(); return
+    }
+    // @ 提及：光标前最近的 @ 到光标
+    const at = before.lastIndexOf('@')
+    if (at >= 0) {
+      const token = before.slice(at + 1)
+      if (/^[\w\u4e00-\u9fa5-]*$/.test(token) && (at === 0 || /\s/.test(before[at - 1]))) {
+        const q = token.toLowerCase()
+        const items = (members || []).filter(m =>
+          !q || m.seat.toLowerCase().includes(q) || String(m.label).toLowerCase().includes(q))
+        if (items.length) {
+          $assist.set({ kind: 'mention', query: token, at, items, hli: 0, apply, inputEl, onPick })
+          return
+        }
+      }
+    }
+    osAssistClose()
+  } catch { osAssistClose() }
+}
+
+function osAssistOnKey(e) {
+  const a = $assist.get()
+  if (!a || !a.items || !a.items.length) return
+  if (e.key === 'ArrowDown') { e.preventDefault(); $assist.set({ ...a, hli: (a.hli + 1) % a.items.length }) }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); $assist.set({ ...a, hli: (a.hli - 1 + a.items.length) % a.items.length }) }
+  else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); osAssistPick(a, a.items[a.hli]) }
+  else if (e.key === 'Escape') { e.preventDefault(); osAssistClose() }
+}
+
+function osAssistPick(a, item) {
+  if (a.kind === 'mention' && typeof a.onPick === 'function') { a.onPick(item); osAssistClose(); return }
+  const el = a.inputEl
+  if (a.kind === 'mention') {
+    const caret = el && el.selectionStart != null ? el.selectionStart : a.at + 1 + a.query.length
+    const next = el ? (el.value.slice(0, a.at) + '@' + item.seat + ' ' + el.value.slice(caret)) : ('@' + item.seat + ' ')
+    a.apply(next, a.at + item.seat.length + 2)
+  } else {
+    const next = el ? (item.cmd + ' ' + el.value.slice(el.selectionStart != null ? el.selectionStart : el.value.length)) : (item.cmd + ' ')
+    a.apply(next, item.cmd.length + 1)
+  }
+  osAssistClose()
+}
+
+// 浮层：fixed 定位到输入框上方；hli 高亮 + 点击选中
+function OsAssistLayer() {
+  const a = useValue($assist)
+  if (!a || !a.inputEl || !a.items || !a.items.length) return null
+  let top = 200, left = 200
+  try {
+    const rect = a.inputEl.getBoundingClientRect()
+    top = Math.max(8, rect.top - 8 - Math.min(a.items.length, 8) * 30)
+    left = rect.left
+  } catch { /* 保底 */ }
+  return jsx('div', { className: 'osg-assist', style: { position: 'fixed', top, left, zIndex: 9800 }, children:
+    a.items.slice(0, 8).map((item, i) => jsxs('button', {
+      className: 'osg-assist-item' + (i === a.hli ? ' on' : ''),
+      onMouseDown: e => { e.preventDefault(); osAssistPick(a, item) },
+      children: [
+        jsx('span', { className: 'osg-assist-main', children: [a.kind === 'mention' ? '@' + item.seat : item.cmd] }),
+        jsx('span', { className: 'osg-assist-desc', children: [a.kind === 'mention' ? (item.label || item.machine || '') : item.desc] }),
+      ],
+    }, (a.kind === 'mention' ? item.key : item.cmd) + i))
+  })
+}
+
+// 附件（办公室 TaskBar）：选择文件 → attach 到该 bot 的 Bot Chat → ref_text 写入输入框
+async function osPickAttachment(bot, setText) {
+  try {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.onchange = async () => {
+      const file = input.files && input.files[0]
+      if (!file) return
+      try {
+        const isImage = /^image\//.test(file.type || '')
+        const dataUrl = await new Promise((res, rej) => {
+          const fr = new FileReader()
+          fr.onload = () => res(String(fr.result)); fr.onerror = rej; fr.readAsDataURL(file)
+        })
+        // 先拿到该 bot 的 Bot Chat 会话（attach 需要 session_id）
+        const chat = await ensureBotChat(bot)
+        const sid = chat && (chat.runtime || chat.stored || chat.session_id)
+        let refText = ''
+        if (isImage) {
+          const base64 = String(dataUrl).split(',')[1] || ''
+          const r = await requestForBot(bot, 'image.attach_bytes', { session_id: sid, content_base64: base64, filename: file.name })
+          if (!r || !r.attached) throw new Error((r && r.message) || '图片附加上传失败')
+          refText = '[图片附件已上传: ' + ((r && r.path) || file.name) + ']\n'
+        } else {
+          const r = await requestForBot(bot, 'file.attach', { name: file.name, session_id: sid, data_url: dataUrl })
+          if (!r || !r.attached || !r.ref_text) throw new Error((r && r.message) || '附件上传失败')
+          refText = r.ref_text + '\n'
+        }
+        $osAttach.set({ label: file.name, refText })
+        setText(prev => (refText + (prev || '')))
+        try { host.notify && host.notify('附件已就绪：' + file.name) } catch {}
+      } catch (e) {
+        try { host.notifyError && host.notifyError('附件失败：' + (e && e.message || e)) } catch {}
+      }
+    }
+    input.click()
+  } catch (e) {
+    try { host.notifyError && host.notifyError('无法打开文件选择器') } catch {}
+  }
+}
 function OsGroupChat() {
   const rooms = useValue($osRooms) || []
   const [activeId, setActiveId] = useState(null)
@@ -4426,14 +4587,21 @@ function OsGroupChat() {
 function OsRoomView({ room }) {
   const [draft, setDraft] = useState('')
   const listRef = useRef(null)
+  const inputRef = useRef(null)
   const log = room.log || []
   useEffect(() => { if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight }, [log.length])
   const eng = room.engine || {}
+
+  const applyDraft = (v, caret) => {
+    setDraft(v)
+    requestAnimationFrame(() => { if (inputRef.current && caret != null) { inputRef.current.selectionStart = inputRef.current.selectionEnd = caret } })
+  }
 
   const send = () => {
     const t = draft.trim()
     if (!t) return
     setDraft('')
+    osAssistClose()
     sendOsUserMessage(room.roomId, t)
   }
   const conclude = async () => {
@@ -4478,11 +4646,18 @@ function OsRoomView({ room }) {
     ] }),
     jsxs('div', { className: 'osg-input', children: [
       jsx('input', {
-        value: draft, placeholder: '输入议题或指令…（@席位 点名；无点名则全员轮流发言）',
-        onChange: e => setDraft(e.target.value),
-        onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } },
+        ref: inputRef,
+        value: draft, placeholder: '输入议题…（@席位 点名 · / 命令）',
+        onChange: e => { setDraft(e.target.value); osAssistOnChange(e.target.value, e.target, applyDraft, room.members) },
+        onKeyDown: e => {
+          const a = $assist.get()
+          if (a && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Tab' || e.key === 'Escape' || (e.key === 'Enter' && a.items && a.items.length))) { osAssistOnKey(e); return }
+          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+        },
+        onBlur: () => setTimeout(osAssistClose, 150),
       }),
       jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: send, children: ['发送'] }),
+      jsx(OsAssistLayer, {}),
     ] }),
   ] })
 }
@@ -4628,7 +4803,14 @@ const OS_SHELL_CSS = `
 .pc1-dot.on{background:#3fb950}
 .pc1-team-down{color:#d29922}
 .pc1-team-dim{opacity:.55}
-.pc1-team-note{margin-left:auto;opacity:.45;font-size:10.5px}
+.amm-os-chatph-d{font-size:13px;line-height:1.7}
+.office-task-attach{border:0;background:transparent;color:var(--ui-text-secondary,inherit);font-size:16px;cursor:pointer;padding:0 4px;line-height:1}
+.office-task-attach:hover{transform:scale(1.15)}
+.osg-assist{background:#1e1e22;color:#e6e6e6;border:1px solid rgba(128,128,128,.4);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);overflow:hidden;min-width:340px}
+.osg-assist-item{display:flex;gap:10px;align-items:baseline;width:100%;text-align:left;padding:7px 12px;border:0;background:none;color:inherit;font:inherit;font-size:12.5px;cursor:pointer}
+.osg-assist-item.on{background:rgba(88,166,255,.18)}
+.osg-assist-main{font-weight:600;white-space:nowrap}
+.osg-assist-desc{opacity:.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 `
 function injectOsShellCss() {
   let el = document.getElementById('amm-os-shell-css')
@@ -6875,7 +7057,7 @@ export default plugin
 
 export const __test = {
   DeskHome, PendingPanel, TaskPanel,
-  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat,
+  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
