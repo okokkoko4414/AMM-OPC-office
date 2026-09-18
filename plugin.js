@@ -4412,6 +4412,41 @@ function osStartRoomFromProposal(p) {
   return room
 }
 
+// ══ 合议纪要归档（三层沉淀：企业台账 + 成员持久记忆 + PC1 文件层）══
+async function archiveOsDeliberation(roomId) {
+  const room = getRoom(roomId)
+  if (!room) return { error: 'room gone' }
+  const userFirst = (room.log || []).find(m => m.from.kind === 'user')
+  const entries = (room.log || []).filter(m => m.from.kind === 'member' && !m.sys).map(m => ({ seat: m.from.seat, text: m.text }))
+  const participants = [...new Set(entries.map(e => e.seat))]
+  const payload = { roomId: room.roomId, topic: userFirst ? userFirst.text.slice(0, 200) : room.name, participants, entries }
+  const resp = await fetch(API + '/api/action/deliberation', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  }).then(r => r.json()).catch(() => null)
+  if (!resp || !resp.ok) return { error: (resp && resp.error) || '归档失败' }
+  const did = resp.id
+  // markdown 纪要 → 写 PC1 工作目录（执行层上下文文件）
+  const md = ['# 合议纪要 ' + did, '', '- 议题：' + payload.topic, '- 时间：' + new Date().toISOString().slice(0, 16).replace('T', ' '),
+    '- 参与：' + (participants.join(', ') || '（无成员发言）'), '', '## 发言记录',
+    ...entries.map(e => '- @' + e.seat + '：' + e.text), '',
+    '（由 AMM OPC OS 合议群自动归档；后续相关任务请先读本纪要恢复上下文）', ''].join('\n')
+  const w = await fetch(API + '/api/action/pc1-file', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: did + '.md', content: md }),
+  }).then(r => r.json()).catch(() => null)
+  // 通知 PC2 成员持久 Bot Chat（进入席位长期会话记忆）
+  let notified = 0
+  for (const m of room.members) {
+    if (m.machine !== 'pc2') continue
+    try {
+      await sendTask({ name: m.seat }, '[合议纪要 ' + did + '] 你参与了合议「' + room.name + '」，议题：' + payload.topic + '。纪要已归档' + (w && w.ok ? '，PC1 存档：' + w.path : '') + '。后续遇到相关任务请先回忆本次合议你的立场与结论。')
+      notified++
+    } catch { /* 尽力 */ }
+  }
+  appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true,
+    text: '合议纪要已归档：' + did + (w && w.ok ? ' ｜ PC1 存档：' + w.path : '') + ' ｜ 已通知 ' + notified + ' 个 PC2 席位（写入其持久会话）' })
+  return { id: did, pc1: w, notified }
+}
+
 // ══ 工单送达（WP3 PC2 方向）：注入席位 Bot Chat，回执落账 ══
 // 复用 office 的 sendTask（ensureBotChat + prompt.submit 同一通道）
 async function deliverWorkorder(t) {
@@ -4681,6 +4716,7 @@ function OsRoomView({ room, onDeleted }) {
   const [draft, setDraft] = useState('')
   const [dlg, setDlg] = useState(null)
   const [confirmDel, setConfirmDel] = useState(false)
+  const [archiving, setArchiving] = useState(false)
   const listRef = useRef(null)
   const inputRef = useRef(null)
   const log = room.log || []
@@ -4720,6 +4756,7 @@ function OsRoomView({ room, onDeleted }) {
         eng.settled && !eng.running ? jsxs(Fragment, { children: [
           jsxs('button', { className: 'aod-btn', onClick: () => runOsRounds(room.roomId, { extraRounds: 3 }), children: ['+3 轮续场'] }),
           jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: conclude, children: ['登记结论为提案'] }),
+          jsx('button', { className: 'aod-btn', disabled: archiving, title: '落台账 + 写 PC1 纪要文件 + 通知全部成员', onClick: async () => { setArchiving(true); const r = await archiveOsDeliberation(room.roomId); setArchiving(false); if (r && r.error) { try { host.notifyError && host.notifyError('归档失败：' + r.error) } catch {} } }, children: [archiving ? '归档中…' : '归档纪要'] }),
         ] }) : null,
         jsxs('button', { className: 'aod-btn', title: '重命名群聊', onClick: () => setDlg('rename'), children: ['✏️'] }),
         jsxs('button', { className: 'aod-btn', title: '追加成员', onClick: () => setDlg('add'), children: ['➕'] }),
