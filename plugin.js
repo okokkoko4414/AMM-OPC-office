@@ -4239,14 +4239,14 @@ async function osMemberSpeak(roomId, member) {
   patchRoom(roomId, r => { r.engine.currentSeat = member.seat; return r })
 
   if (member.machine === 'pc1') {
-    // 跨机：A2A 同步代理（110s 内回单句），天然匹配轮转单句协议
+    // 跨机：SSH CLI 精准通道——直达该席位本人（hermes -p <席位> chat -q），单句回执匹配轮转协议
     try {
       const resp = await fetch(API + '/api/action/a2a-send', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: `[给 @${member.seat}] ` + prompt }),
+        body: JSON.stringify({ target: String(member.seat || '').replace(/^pc1\//, ''), text: `[合议群「${room.name}」@${member.seat}] ` + prompt }),
       }).then(r => r.json())
       const text = resp && (resp.reply || resp.text || '')
-      if (resp && resp.ok === false) return { ok: false, error: resp.error || 'a2a failed' }
+      if (resp && resp.ok === false) return { ok: false, error: resp.error || '跨机通道失败' }
       return { ok: true, text: String(text || '').slice(0, 800) }
     } catch (e) { return { ok: false, error: String(e && e.message || e) } }
   }
