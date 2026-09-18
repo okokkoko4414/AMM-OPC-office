@@ -4349,6 +4349,24 @@ function osStartRoomFromProposal(p) {
   return room
 }
 
+// ══ 工单送达（WP3 PC2 方向）：注入席位 Bot Chat，回执落账 ══
+// 复用 office 的 sendTask（ensureBotChat + prompt.submit 同一通道）
+async function deliverWorkorder(t) {
+  const text = `[AMM OPC 工单 ${t.workOrderId}]\n任务：${t.title}\n优先级：${t.priority || 'P2'}\n时限：${t.deadline || '尽快'}\n【回执极简契约】只回一行：「已受理」或「缺件：<缺什么>」。交付物异步落盘。`
+  try {
+    await sendTask({ name: t.assignedSeat }, text)
+    await fetch(API + '/api/action/workorder-reply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workOrderId: t.workOrderId, reply: '已送达到 ' + t.assignedSeat + ' 会话', repliedBy: 'os-desk' }),
+    }).then(r => r.json()).catch(() => null)
+    try { host.notify && host.notify('工单 ' + t.workOrderId + ' 已送达 ' + t.assignedSeat) } catch {}
+    return true
+  } catch (e) {
+    try { host.notifyError && host.notifyError('送达失败：' + (e && e.message || e)) } catch {}
+    return false
+  }
+}
+
 // ══ PC1 远程团队横条（办公室页顶部，WP2）══
 // 数据源 /api/pc1/team（快照服务经 SSH 拉 PC1 hermes profile list，5 分钟缓存）
 // 诚实边界：running 仅表示 PC1 网关在线，不代表正在干活
@@ -5278,6 +5296,8 @@ function KanbanDetailDrawer({ t, busy, msg, run, onDone, onClose }) {
         isPaperclip ? 'paperclip 工单的状态变更在 PC1 paperclip 侧操作，决策中枢只读。' : '此工单当前状态不支持操作。',
       ] }),
       el('div', { className: 'aod-btnrow', children: [
+        !isPaperclip && String(t.assignedSeat || '').startsWith('pc1') ? el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/dispatch-pc1', { workOrderId: t.workOrderId }, onDone), children: ['跨机派发到 PC1'] }) : null,
+        !isPaperclip && !String(t.assignedSeat || '').startsWith('pc1') ? el(Btn, { kind: 'pri', onClick: () => { deliverWorkorder(t).then(ok => { if (ok) onDone() }) }, children: ['送达到席位会话'] }) : null,
         el(Btn, { onClick: () => { try { osStartRoomFromProposal(t); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['发起合议（8 席）'] }),
       ] }),
     ] }),
