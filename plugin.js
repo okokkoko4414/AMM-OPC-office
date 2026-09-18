@@ -4397,10 +4397,10 @@ function Pc1TeamBar() {
     jsxs('span', { className: 'pc1-team-label', children: ['PC1 远程团队'] }),
     unreachable ? jsxs('span', { className: 'pc1-team-down', children: ['不可达（SSH 断开）'] })
       : loading ? jsxs('span', { className: 'pc1-team-dim', children: ['加载中…'] })
-      : profiles.map(p => jsxs('span', { key: p.name, className: 'pc1-team-chip', title: (p.model || '') + ' · ' + (p.status || ''), children: [
+      : profiles.map(p => jsxs('span', { className: 'pc1-team-chip', title: (p.model || '') + ' · ' + (p.status || ''), children: [
           jsxs('i', { className: 'pc1-dot' + (p.status === 'running' ? ' on' : '') }),
           jsxs('span', { children: [p.name] }),
-        ] })),
+        ] }, p.name)),
     jsxs('span', { className: 'pc1-team-note', children: ['在线≠在干活'] }),
   ] })
 }
@@ -4563,7 +4563,6 @@ function OsGroupChat() {
       jsxs('div', { className: 'osg-room-list', children: [
         rooms.length === 0 ? jsxs('div', { className: 'osg-empty', children: ['还没有合议群。点上方「+ 发起合议」创建。'] }) : null,
         ...rooms.map(r => jsxs('button', {
-          key: r.roomId,
           className: 'osg-room-item' + (activeId === r.roomId ? ' on' : ''),
           onClick: () => setActiveId(r.roomId),
           children: [
@@ -4574,7 +4573,7 @@ function OsGroupChat() {
               r.engine && r.engine.settled ? jsx('span', { className: 'osg-settled', children: ['已落定'] }) : null,
             ] }),
           ],
-        })),
+        }, r.roomId)),
       ] }),
     ] }),
     jsxs('div', { className: 'osg-main', children: [
