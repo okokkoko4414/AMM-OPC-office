@@ -3601,6 +3601,8 @@ function Planes() {
 }
 
 function TaskBar({ roster, activeProfile }) {
+  const grillState = useValue($grill)
+  const grillActive = !!(grillState && grillState.ctxKey === 'task')
   const selected = useValue($selected)
   const focusToken = useValue($focusTask)
   const jobs = useValue($jobs)
@@ -3663,6 +3665,7 @@ function TaskBar({ roster, activeProfile }) {
       void send()
     },
     children: [
+      grillActive && grillState ? jsx(OsGrillPanel, { grill: grillState }) : null,
       jsx(BotPicker, { roster, bot, look }),
       jsx('button', {
         type: 'button',
@@ -3671,12 +3674,13 @@ function TaskBar({ roster, activeProfile }) {
         onClick: () => { void osPickAttachment(bot, setText) },
         children: '📎'
       }),
+      grillActive && grillState ? jsx(OsGrillPanel, { grill: grillState }) : null,
       jsx('input', {
         ref: inputRef,
         className: cn('office-task-input', job?.state === JOB_STATES.FAILED && 'is-failed'),
         value: text,
-        placeholder: sending ? `${look.title} 正在处理…` : job?.state === JOB_STATES.FAILED ? '检查失败的任务并重试…' : `告诉 ${look.title}…（/ 命令 · 📎 附件）`,
-        disabled: busy || sending || unknown,
+        placeholder: grillActive ? '拷问进行中…（Enter 提交答案 / 生成简报 · Esc 恢复原稿）' : sending ? `${look.title} 正在处理…` : job?.state === JOB_STATES.FAILED ? '检查失败的任务并重试…' : `告诉 ${look.title}…（/ 命令 · 📎 附件 · Tab 拷问）`,
+        disabled: busy || sending || unknown || grillActive,
         'aria-describedby': job?.error ? 'office-task-status' : undefined,
         onChange: event => {
           setText(event.target.value)
@@ -3689,7 +3693,17 @@ function TaskBar({ roster, activeProfile }) {
             if (at2 >= 0) setText(event.target.value.slice(0, at2) + event.target.value.slice(caret2))
           })
         },
-        onKeyDown: event => osAssistOnKey(event)
+        onKeyDown: event => {
+          const a = $assist.get()
+          if (a && (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Tab' || event.key === 'Escape' || (event.key === 'Enter' && a.items && a.items.length))) { osAssistOnKey(event); return }
+          if (grillActive && grillState) {
+            if (event.key === 'Escape') { event.preventDefault(); osGrillClose(true); return }
+            if (event.key === 'Enter') { event.preventDefault(); (grillState.question && !grillState.done) ? osGrillSubmit(null) : osGrillBrief(); return }
+            if (event.key === 'Tab') { event.preventDefault(); if (grillState.question) osGrillSubmit(grillState.recommended || grillState.inputAnswer); return }
+            return
+          }
+          if (event.key === 'Tab' && text.trim()) { event.preventDefault(); osGrillStart('task', text, v => setText(v)); return }
+        }
       }),
       unknown
         ? jsxs(Fragment, { children: [
@@ -4159,8 +4173,11 @@ function buildOsTurnPrompt(room, member, newMsgs) {
     const who = m.from.kind === 'user' ? '峰哥' : (m.from.label || m.from.seat)
     return `  ${who}: ${m.text}`
   }).join('\n')
+  const modeNote = (room.mode || 'ASK') === 'EXEC'
+    ? '【房间模式：执行】本轮可以执行与议题直接相关的操作。'
+    : '【房间模式：合议讨论】本轮只输出你的立场、判断与分析，不要执行任何变更操作、不要调用任何执行类工具。'
   return [
-    `[AMM OPC 合议群「${room.name}」] 你是 @${member.seat}（${member.label}），${member.machine === 'pc1' ? 'PC1 执行团队的智能体' : 'AMM 总经办席位'}，正在参与多智能体合议。`,
+    `[AMM OPC 合议群「${room.name}」] 你是 @${member.seat}（${member.label}），${member.machine === 'pc1' ? 'PC1 执行团队的智能体' : 'AMM 总经办席位'}，正在参与多智能体合议。${modeNote}`,
     '',
     '自你上次发言后的新消息（最早在前）：',
     lines || '  （暂无）',
@@ -4328,6 +4345,7 @@ function createOsRoom({ name, members, maxRounds }) {
   const room = {
     roomId: mintOsRoomId(), name: name || '合议 ' + new Date().toLocaleDateString('zh-CN'),
     members: members.slice(0, OS_MAX_MEMBERS), maxRounds: Math.max(1, Math.min(maxRounds || OS_DEFAULT_ROUNDS, OS_MAX_ROUNDS_LIMIT)),
+    mode: 'ASK',
     log: [], watermarks: {}, sessions: {}, engine: { epoch: 0, running: false, settled: false, round: 0, currentSeat: null },
     createdAt: Date.now(), lastActiveAt: Date.now(),
   }
@@ -4677,6 +4695,96 @@ function OsAddMembersDialog({ room, onClose }) {
   ] })
 }
 
+// ══ Grill 拷问面板（吸收 grill-tab MIT 设计：ladder 随请求传、简报绝不代发）══
+// $grill: {ctxKey, apply, draft0, text, ladder[], loading, question, recommended, options, category, done, reason, inputAnswer, error}
+const $grill = atom(null)
+
+async function osGrillStart(ctxKey, text, apply) {
+  $grill.set({ ctxKey, apply, draft0: text, text, ladder: [], loading: true, inputAnswer: '' })
+  const r = await fetch(API + '/api/assist/interrogate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, ladder: [] }),
+  }).then(r => r.json()).catch(e => ({ error: String(e) }))
+  const g = $grill.get()
+  if (!g || g.ctxKey !== ctxKey) return
+  if (r.error) { $grill.set({ ...g, loading: false, error: r.error }); return }
+  $grill.set({ ...g, loading: false, done: !!r.done, reason: r.reason || '', question: r.question || null,
+    recommended: r.recommended || '', options: r.options || [], category: r.category || '', inputAnswer: '' })
+}
+
+async function osGrillSubmit(answer) {
+  const g = $grill.get()
+  if (!g || !g.question) return
+  const ans = String(answer != null ? answer : g.inputAnswer || '').trim() || g.recommended || ''
+  const ladder = [...g.ladder, { question: g.question, answer: ans, category: g.category, recommended: g.recommended }]
+  $grill.set({ ...g, ladder, loading: true, inputAnswer: '', question: null })
+  const r = await fetch(API + '/api/assist/interrogate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: g.text, ladder }),
+  }).then(r => r.json()).catch(e => ({ error: String(e) }))
+  const g2 = $grill.get()
+  if (!g2 || g2.ctxKey !== g.ctxKey) return
+  if (r.error) { $grill.set({ ...g2, loading: false, error: r.error }); return }
+  $grill.set({ ...g2, loading: false, done: !!r.done, reason: r.reason || '', question: r.question || null,
+    recommended: r.recommended || '', options: r.options || [], category: r.category || '' })
+}
+
+async function osGrillBrief() {
+  const g = $grill.get()
+  if (!g) return
+  $grill.set({ ...g, loading: true })
+  const r = await fetch(API + '/api/assist/brief', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: g.text, ladder: g.ladder }),
+  }).then(r => r.json()).catch(() => null)
+  const g2 = $grill.get()
+  if (!g2) return
+  if (r && r.ok) { g2.apply(r.brief); $grill.set(null); try { host.notify && host.notify('简报已填入输入框，由你确认后发送') } catch {} }
+  else $grill.set({ ...g2, loading: false, error: (r && r.error) || '简报生成失败' })
+}
+
+function osGrillClose(restore) {
+  const g = $grill.get()
+  if (g && restore !== false) { try { g.apply(g.draft0) } catch {} }
+  $grill.set(null)
+}
+
+function OsGrillPanel({ grill }) {
+  const setAns = v => { const g = $grill.get(); if (g) $grill.set({ ...g, inputAnswer: v }) }
+  return jsxs('div', { className: 'osg-grill', children: [
+    jsxs('div', { className: 'osg-grill-head', children: [
+      jsx('span', { className: 'osg-grill-title', children: ['🔥 拷问 · 把草稿烤成简报'] }),
+      jsxs('button', { className: 'osg-grill-x', onClick: () => osGrillClose(true), children: ['Esc 恢复原稿'] }),
+    ] }),
+    grill.loading ? jsx('div', { className: 'osg-grill-loading', children: ['辅助模型思考中…'] }) : null,
+    grill.error ? jsx('div', { className: 'osg-grill-err', children: [grill.error] }) : null,
+    (grill.ladder || []).map((r, i) => jsxs('div', { className: 'osg-grill-rung', children: [
+      jsxs('span', { className: 'osg-grill-q', children: ['Q' + (i + 1) + ' ' + r.question] }),
+      jsxs('span', { className: 'osg-grill-a', children: ['→ ' + (r.answer || '（未答）')] }),
+    ] }, i)),
+    !grill.loading && grill.done ? jsxs('div', { className: 'osg-grill-done', children: [
+      jsx('div', { children: ['草稿已足够明确：' + (grill.reason || '')] }),
+      jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: () => osGrillBrief(), children: ['生成简报'] }),
+    ] }) : null,
+    !grill.loading && !grill.done && grill.question ? jsxs('div', { className: 'osg-grill-live', children: [
+      jsxs('div', { className: 'osg-grill-q', children: [grill.question] }),
+      grill.recommended ? jsxs('button', { className: 'osg-grill-rec', onClick: () => osGrillSubmit(grill.recommended), children: ['推荐：' + grill.recommended + '（Tab）'] }) : null,
+      jsxs('div', { className: 'osg-grill-opts', children:
+        (grill.options || []).map((o, i) => jsxs('button', { key: i, className: 'osg-grill-opt', onClick: () => osGrillSubmit(o), children: [o] })) }),
+      jsx('input', { className: 'osg-grill-ans', value: grill.inputAnswer,
+        onChange: e => setAns(e.target.value),
+        placeholder: '或自行输入答案（Enter 提交）',
+        onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); osGrillSubmit(null) } },
+        autoFocus: true }),
+      jsxs('div', { className: 'aod-btnrow', style: { marginTop: 6 }, children: [
+        jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: () => osGrillSubmit(null), children: ['提交答案（Enter）'] }),
+        (grill.ladder || []).length ? jsxs('button', { className: 'aod-btn', onClick: () => osGrillBrief(), children: ['生成简报'] }) : null,
+      ] }),
+    ] }) : null,
+    jsx('div', { className: 'osg-grill-note', children: ['简报生成后填入输入框，由你亲自发送——绝不代发'] }),
+  ] })
+}
+
 function OsGroupChat() {
   const rooms = useValue($osRooms) || []
   const [activeId, setActiveId] = useState(null)
@@ -4717,6 +4825,8 @@ function OsRoomView({ room, onDeleted }) {
   const [dlg, setDlg] = useState(null)
   const [confirmDel, setConfirmDel] = useState(false)
   const [archiving, setArchiving] = useState(false)
+  const grill = useValue($grill)
+  const grillActive = !!(grill && grill.ctxKey === 'room:' + room.roomId)
   const listRef = useRef(null)
   const inputRef = useRef(null)
   const log = room.log || []
@@ -4733,6 +4843,7 @@ function OsRoomView({ room, onDeleted }) {
     if (!t) return
     setDraft('')
     osAssistClose()
+    osGrillClose(false)
     sendOsUserMessage(room.roomId, t)
   }
   const conclude = async () => {
@@ -4752,6 +4863,10 @@ function OsRoomView({ room, onDeleted }) {
         ] }),
       ] }),
       jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+        jsxs('button', { className: 'aod-btn' + ((room.mode || 'ASK') === 'EXEC' ? ' aod-btn-danger' : ' aod-btn-pri'),
+          title: '点击切换：合议讨论（ASK，成员只表态不执行）/ 执行（EXEC，成员可执行议题相关操作）',
+          onClick: () => patchRoom(room.roomId, r => { r.mode = (r.mode || 'ASK') === 'ASK' ? 'EXEC' : 'ASK'; return r }),
+          children: [(room.mode || 'ASK') === 'EXEC' ? '⚡ 执行模式' : '💬 合议模式'] }),
         eng.running ? jsxs('button', { className: 'aod-btn aod-btn-danger', onClick: () => stopOsRounds(room.roomId), children: ['停止'] }) : null,
         eng.settled && !eng.running ? jsxs(Fragment, { children: [
           jsxs('button', { className: 'aod-btn', onClick: () => runOsRounds(room.roomId, { extraRounds: 3 }), children: ['+3 轮续场'] }),
@@ -4783,13 +4898,23 @@ function OsRoomView({ room, onDeleted }) {
       }),
     ] }),
     jsxs('div', { className: 'osg-input', children: [
+      grillActive && grill ? jsx(OsGrillPanel, { grill: grill }) : null,
       jsx('input', {
         ref: inputRef,
-        value: draft, placeholder: '输入议题…（@席位 点名 · / 命令）',
+        value: draft, placeholder: grillActive ? '拷问进行中…（Enter 提交答案 / 生成简报 · Esc 恢复原稿）' : '输入议题…（@席位 点名 · / 命令 · Tab 拷问草稿）',
+        disabled: grillActive,
         onChange: e => { setDraft(e.target.value); osAssistOnChange(e.target.value, e.target, applyDraft, room.members) },
         onKeyDown: e => {
           const a = $assist.get()
           if (a && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Tab' || e.key === 'Escape' || (e.key === 'Enter' && a.items && a.items.length))) { osAssistOnKey(e); return }
+          const g = $grill.get()
+          if (grillActive && g) {
+            if (e.key === 'Escape') { e.preventDefault(); osGrillClose(true); return }
+            if (e.key === 'Enter') { e.preventDefault(); (g.question && !g.done) ? osGrillSubmit(null) : osGrillBrief(); return }
+            if (e.key === 'Tab') { e.preventDefault(); if (g.question) osGrillSubmit(g.recommended || g.inputAnswer); return }
+            return
+          }
+          if (e.key === 'Tab' && draft.trim()) { e.preventDefault(); osGrillStart('room:' + room.roomId, draft, applyDraft); return }
           if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
         },
         onBlur: () => setTimeout(osAssistClose, 150),
@@ -4941,6 +5066,25 @@ const OS_SHELL_CSS = `
 .pc1-dot.on{background:#3fb950}
 .pc1-team-down{color:#d29922}
 .pc1-team-dim{opacity:.55}
+.pc1-team-note{margin-left:auto;opacity:.45;font-size:10.5px}
+/* ── Grill 拷问面板 ── */
+.osg-grill{position:fixed;left:50%;transform:translateX(-50%);bottom:120px;width:520px;max-width:92vw;max-height:60vh;overflow-y:auto;background:#1e1e22;color:#e6e6e6;border:1px solid rgba(88,166,255,.45);border-radius:10px;box-shadow:0 12px 36px rgba(0,0,0,.5);z-index:9700;padding:14px 16px}
+.osg-grill-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.osg-grill-title{font-weight:700;font-size:13.5px}
+.osg-grill-x{background:none;border:0;color:inherit;opacity:.6;cursor:pointer;font-size:11.5px}
+.osg-grill-x:hover{opacity:1}
+.osg-grill-loading{font-size:12px;opacity:.7;padding:6px 0}
+.osg-grill-err{color:#f85149;font-size:12px;padding:6px 0}
+.osg-grill-rung{padding:5px 0;border-bottom:1px dashed rgba(128,128,128,.2);font-size:12px}
+.osg-grill-q{font-weight:600;font-size:12.5px;margin-bottom:2px}
+.osg-grill-a{opacity:.75;font-size:12px}
+.osg-grill-done{padding:8px 0;font-size:12.5px}
+.osg-grill-live{padding:4px 0}
+.osg-grill-rec{display:block;width:100%;text-align:left;margin:6px 0;padding:7px 10px;border-radius:6px;border:1px solid rgba(88,166,255,.5);background:rgba(88,166,255,.1);color:inherit;font-size:12.5px;cursor:pointer}
+.osg-grill-opts{display:flex;flex-direction:column;gap:4px;margin:6px 0}
+.osg-grill-opt{text-align:left;padding:6px 10px;border-radius:6px;border:1px solid rgba(128,128,128,.3);background:rgba(127,127,127,.08);color:inherit;font-size:12.5px;cursor:pointer}
+.osg-grill-opt:hover{background:rgba(127,127,127,.2)}
+.osg-grill-ans{width:100%;box-sizing:border-box;margin-top:6px;padding:7px 10px;border:1px solid rgba(128,128,128,.4);border-radius:6px;background:rgba(127,127,127,.08);color:inherit;font-size:12.5px}
 .amm-os-chatph-d{font-size:13px;line-height:1.7}
 .office-task-attach{border:0;background:transparent;color:var(--ui-text-secondary,inherit);font-size:16px;cursor:pointer;padding:0 4px;line-height:1}
 .office-task-attach:hover{transform:scale(1.15)}
@@ -7195,7 +7339,7 @@ export default plugin
 
 export const __test = {
   DeskHome, PendingPanel, TaskPanel,
-  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
+  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
