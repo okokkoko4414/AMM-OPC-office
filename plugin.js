@@ -4108,7 +4108,7 @@ const OS_DEFAULT_ROUNDS = 6
 const OS_MAX_ROUNDS_LIMIT = 12
 const OS_LOG_LIMIT = 200          // 每房滚动 retention
 const OS_HISTORY_LINES = 24       // 注入协议时携带的新消息上限
-const OS_TURN_TIMEOUT_MS = 120000 // 成员发言超时
+const OS_TURN_TIMEOUT_MS = 300000 // 成员发言超时（长输出任务如执行清单可达数分钟）
 const OS_RESUME_POLL_MS = 5000
 
 // ── 房间 atom 与持久化 ──
@@ -4159,8 +4159,17 @@ function parseOsMentions(text, members) {
     }
   }
   const seen = new Set(); const out = []
-  for (const m of hits) { if (!seen.has(m.key)) { seen.add(m.key); out.push(m) } }
-  return out.length ? out : members.slice()
+  const order = []
+  const lower = String(text).toLowerCase()
+  for (const m of members) {
+    const k = '@' + m.seat.toLowerCase()
+    const idx = lower.indexOf(k)
+    if (idx >= 0) order.push({ m, idx })
+  }
+  order.sort((a, b) => a.idx - b.idx)  // 按 @ 在文本中的出现顺序（路由顺序）
+  for (const { m } of order) { if (!seen.has(m.key)) { seen.add(m.key); out.push(m) } }
+  if (out.length) return out
+  return members.slice()
 }
 // 水位增量：取该成员自上次发言后的新消息
 function osNewMessages(room, memberKey) {
@@ -4284,6 +4293,8 @@ async function osMemberSpeak(roomId, member) {
     let res = await attempt()
     if (!res.ok && /session/i.test(res.error || '')) {
       patchRoom(roomId, r => { delete r.sessions[member.key]; return r }) // 会话失效：清记录强制重建
+      appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, sys: true,
+        text: '（@' + member.seat + ' 会话失效，已自动重建重试）', round: 0 })
       res = await attempt()
     }
     return res.ok ? res : { ok: false, error: res.error || 'no reply' }
@@ -4326,19 +4337,38 @@ async function runOsRounds(roomId, opts) {
       if (!responders.length) break
 
       let spokeInRound = 0
-      for (const member of responders) {
+      const directed = lastUserMsg && /@\S/.test(lastUserMsg.text)
+      const guard = () => {
         room = getRoom(roomId)
-        if (!room || !room.engine || !room.engine.running || (room.engine.epoch || 0) !== epoch) break
+        return room && room.engine && room.engine.running && (room.engine.epoch || 0) === epoch
+      }
+      const consume = async (member) => {
         const res = await osMemberSpeak(roomId, member)
-        // 推水位（无论 pass 与否，该成员已读到当前 log 末尾）
         patchRoom(roomId, r => { r.watermarks[member.key] = (r.log || []).length; return r })
         if (res.ok && !isOsPass(res.text)) {
           appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, text: res.text, round })
-          spokeInRound++
           anySpokeThisEpoch = true
-        } else if (!res.ok) {
-          appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, text: '（发言失败：' + (res.error || '未知') + '）', round, sys: true })
+          return 1
         }
+        if (!res.ok) {
+          appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label },
+            text: '（发言失败：' + (res.error || '未知') + '）', round, sys: true })
+        }
+        return 0
+      }
+      if (directed) {
+        // 定向：按 @mention 出现顺序串行（后发言者能看到先发言者的本轮立场，路由依赖场景）
+        for (const member of responders) {
+          if (!guard()) break
+          spokeInRound += await consume(member)
+        }
+      } else {
+        // 全员：并行发起、完成即入账（流畅性：一轮 = 最慢席位而非各席之和）
+        const results = await Promise.all(responders.map(async member => {
+          if (!guard()) return 0
+          return consume(member)
+        }))
+        spokeInRound = results.reduce((a, b) => a + b, 0)
       }
       if (spokeInRound === 0) break  // 全员 pass → 提前 settled
     }
