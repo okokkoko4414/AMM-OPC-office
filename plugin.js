@@ -4184,9 +4184,13 @@ function buildOsTurnPrompt(room, member, newMsgs) {
   }).join('\n')
   const modeNote = (room.mode || 'ASK') === 'EXEC'
     ? '【房间模式：执行】本轮可以执行与议题直接相关的操作。'
-    : '【房间模式：合议讨论】本轮只输出你的立场、判断与分析，不要执行任何变更操作、不要调用任何执行类工具。'
+    : '【房间模式：合议讨论】三段纪律：①禁变更——不写文件、不建工单、不调 cron、不对外发送、不改配置（合议未收敛前任何变更都是负资产）；②允许只读调研——web 搜索、读文档、查台账、拉数据、跑只读探针命令，为你的判断取证；③执行入口——合议落定后由 CEO 散会落单，执行走工单通道，群聊只作会场。'
+  const isReviewer = /independent-reviewer/i.test(String(member.seat || ''))
+  const roleLine = isReviewer
+    ? `[AMM OPC 合议群「${room.name}」] 你是独立评审席（裁判，非辩手）。${modeNote} 你的唯一职责：只输出你将如何审查最终方案的判据——什么情况 hold、需要什么证据件、哪些数字你会独立重算。不评价任何席位方案的对错、不给改进建议、不参与口径拉锯（判据是抽象规则，审查在方案落定后独立进行）。`
+    : `[AMM OPC 合议群「${room.name}」] 你是 @${member.seat}（${member.label}），${member.machine === 'pc1' ? 'PC1 执行团队的智能体' : 'AMM 总经办席位'}，正在参与多智能体合议。${modeNote}`
   return [
-    `[AMM OPC 合议群「${room.name}」] 你是 @${member.seat}（${member.label}），${member.machine === 'pc1' ? 'PC1 执行团队的智能体' : 'AMM 总经办席位'}，正在参与多智能体合议。${modeNote}`,
+    roleLine,
     '',
     '自你上次发言后的新消息（最早在前）：',
     lines || '  （暂无）',
@@ -4514,6 +4518,18 @@ function osStartRoomFromProposal(p) {
   return room
 }
 
+// ══ 记忆投递直通通道（绕过 office job 闸门——纪要与审查包是"记忆投递"不是"任务派发"，
+// 走 sendTask 会被 jobAllowsSubmission 静默拦截：通知先把 job 激活，审查包就永远发不出）══
+async function osDeliverToSeat(seat, text) {
+  const bot = { name: seat }
+  const chat = await ensureBotChat(bot)
+  if (!chat || !chat.runtime) throw new Error('无法打开席位会话')
+  await withBotLease(bot, async () => {
+    await requestForBot(bot, 'prompt.submit', { session_id: chat.runtime, text })
+  })
+  return true
+}
+
 // ══ 合议纪要归档（三层沉淀：企业台账 + 成员持久记忆 + PC1 文件层）══
 async function archiveOsDeliberation(roomId) {
   const room = getRoom(roomId)
@@ -4540,13 +4556,33 @@ async function archiveOsDeliberation(roomId) {
   for (const m of room.members) {
     if (m.machine !== 'pc2') continue
     try {
-      await sendTask({ name: m.seat }, '[合议纪要 ' + did + '] 你参与了合议「' + room.name + '」，议题：' + payload.topic + '。纪要已归档' + (w && w.ok ? '，PC1 存档：' + w.path : '') + '。后续遇到相关任务请先回忆本次合议你的立场与结论。')
+      await osDeliverToSeat(m.seat, '[合议纪要 ' + did + '] 你参与了合议「' + room.name + '」，议题：' + payload.topic + '。纪要已归档' + (w && w.ok ? '，PC1 存档：' + w.path : '') + '。后续遇到相关任务请先回忆本次合议你的立场与结论。')
       notified++
     } catch { /* 尽力 */ }
   }
+  // 审查包：独立评审席落定后独立审查（材料隔离——剥离全部合议过程发言，含 reviewer 自己的）
+  let reviewSent = false
+  const reviewer = (room.members || []).find(m => /independent-reviewer/i.test(String(m.seat || '')) && m.machine === 'pc2')
+  const ceoFinals = (room.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
+  if (reviewer && (ceoFinals.length || payload.topic)) {
+    try {
+      const pkg = [
+        '[独立评审审查包 · ' + did + ']', '',
+        '## 审查纪律（先读顺序固定）',
+        '① 先读 OBJECTIVE 目标本（D:/hermes/constitution/OBJECTIVE.md）→ ② 原始证据（各席位落盘件，见纪要内出处）→ ③ 最后才读下方方案结论。',
+        '关键数字独立重算后表态；hold 单须含「时限或指名解除人」至少其一。',
+        '', '## 最终方案（CEO 终裁与裁决，剥离合议过程发言）',
+        ...ceoFinals.map(m => '### ' + new Date(m.at || Date.now()).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '\\n' + m.text),
+        '', '## 议题', payload.topic, '',
+        '本包不含各席位合议期发言（独立性保护）。产出 hold/放行意见写入你的持久会话即可。',
+      ].join('\\n')
+      await osDeliverToSeat(reviewer.seat, pkg)
+      reviewSent = true
+    } catch { /* 尽力 */ }
+  }
   appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true,
-    text: '合议纪要已归档：' + did + (w && w.ok ? ' ｜ PC1 存档：' + w.path : '') + ' ｜ 已通知 ' + notified + ' 个 PC2 席位（写入其持久会话）' })
-  return { id: did, pc1: w, notified }
+    text: '合议纪要已归档：' + did + (w && w.ok ? ' ｜ PC1 存档：' + w.path : '') + ' ｜ 已通知 ' + notified + ' 个 PC2 席位' + (reviewSent ? ' ｜ 审查包已送独立评审（材料隔离）' : '') })
+  return { id: did, pc1: w, notified, reviewSent }
 }
 
 // ══ 工单送达（WP3 PC2 方向）：注入席位 Bot Chat，回执落账 ══
@@ -7423,7 +7459,7 @@ export default plugin
 
 export const __test = {
   DeskHome, PendingPanel, TaskPanel,
-  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
+  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
