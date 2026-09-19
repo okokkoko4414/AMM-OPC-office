@@ -4207,10 +4207,23 @@ async function ensureOsSession(member, roomId) {
     try {
       const r = await requestForBot(member, 'session.resume', { session_id: existing })
       if (r && (r.runtime || r.session_id || r.id)) return { stored: existing, runtime: r.runtime || r.session_id || r.id }
-    } catch (e) {
-      // 会话可能被网关回收/失效（session not found / 4007 / invalid）——清记录后走重建，不 fail-closed
-      patchRoom(roomId, r => { delete r.sessions[member.key]; return r })
-    }
+    } catch (e) { /* 失效：标题兜底 */ }
+    // 标题兜底：ws_orphan_reap 后 stored id 失效，但会话实体常仍在——按标题找回
+    try {
+      const lst = await requestForBot(member, 'session.list', { limit: 50 })
+      const rows = (lst && (lst.sessions || lst.rows || lst.items)) || []
+      const want = 'OS-Group: ' + roomId
+      const hit = rows.find(x => x && String(x.title || '').includes(want))
+      if (hit) {
+        const sid = hit.session_id || hit.id || (hit.session && hit.session.id)
+        if (sid) {
+          const rr = await requestForBot(member, 'session.resume', { session_id: sid }).catch(() => null)
+          patchRoom(roomId, r => { r.sessions[member.key] = sid; return r })
+          return { stored: sid, runtime: (rr && rr.runtime) || sid }
+        }
+      }
+    } catch { /* 走 create */ }
+    patchRoom(roomId, r => { delete r.sessions[member.key]; return r })
   }
   const created = await requestForBot(member, 'session.create', {
     profile: member.name, title: 'OS-Group: ' + roomId, hidden: true, room_plumbing: true, follow_profile_config: true,
@@ -4224,6 +4237,28 @@ async function ensureOsSession(member, roomId) {
 const osTurnWaiters = new Map() // sessionKey -> {resolve, baseline, memberKey, roomId}
 function osHandleGatewayEvent(ev) {
   if (!ev || !ev.type) return
+  // ws_orphan_reap：网关回收孤儿会话并重配 id——命中我们的成员会话时立即清记录（下次发言自动重建）
+  if (ev.type === 'session.reclaimed') {
+    try {
+      const p = ev.payload || {}
+      const ids = [p.session_id, p.stored_session_id].filter(Boolean).map(String)
+      if (ids.length) {
+        const rooms = $osRooms.get() || []
+        let hit = false
+        const next = rooms.map(r => {
+          const sess = r.sessions || {}
+          const keys = Object.keys(sess).filter(k => ids.includes(String(sess[k])))
+          if (!keys.length) return r
+          hit = true
+          const ns = { ...sess }
+          for (const k of keys) delete ns[k]
+          return { ...r, sessions: ns }
+        })
+        if (hit) { $osRooms.set(next); saveOsRooms() }
+      }
+    } catch { /* 尽力 */ }
+    return
+  }
   if (ev.type !== 'message.complete' && ev.type !== 'message.error') return
   const sid = ev.session_id || (ev.payload && ev.payload.session_id)
   if (!sid) return
@@ -7388,7 +7423,7 @@ export default plugin
 
 export const __test = {
   DeskHome, PendingPanel, TaskPanel,
-  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
+  $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
