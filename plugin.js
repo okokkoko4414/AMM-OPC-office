@@ -4199,7 +4199,8 @@ async function ensureOsSession(member, roomId) {
       const r = await requestForBot(member, 'session.resume', { session_id: existing })
       if (r && (r.runtime || r.session_id || r.id)) return { stored: existing, runtime: r.runtime || r.session_id || r.id }
     } catch (e) {
-      if (!/4007/.test(String(e && e.message))) throw e // 4007=会话不存在，重建；其余 fail-closed
+      // 会话可能被网关回收/失效（session not found / 4007 / invalid）——清记录后走重建，不 fail-closed
+      patchRoom(roomId, r => { delete r.sessions[member.key]; return r })
     }
   }
   const created = await requestForBot(member, 'session.create', {
@@ -4268,8 +4269,8 @@ async function osMemberSpeak(roomId, member) {
     } catch (e) { return { ok: false, error: String(e && e.message || e) } }
   }
 
-  // PC2：隐藏房间会话
-  try {
+  // PC2：隐藏房间会话（失效自动重建，重试一次）
+  const attempt = async () => {
     const sess = await ensureOsSession(member, roomId)
     const resume0 = await requestForBot(member, 'session.resume', { session_id: sess.stored }).catch(() => null)
     const baseline = ((resume0 && (resume0.messages || resume0.history)) || []).length
@@ -4278,7 +4279,25 @@ async function osMemberSpeak(roomId, member) {
       const res = await waitOsTurn(member, roomId, sess, baseline)
       return res.ok ? { ok: true, text: String(res.text || '').slice(0, 1200) } : { ok: false, error: res.error || 'no reply' }
     })
-  } catch (e) { return { ok: false, error: String(e && e.message || e) } }
+  }
+  try {
+    let res = await attempt()
+    if (!res.ok && /session/i.test(res.error || '')) {
+      patchRoom(roomId, r => { delete r.sessions[member.key]; return r }) // 会话失效：清记录强制重建
+      res = await attempt()
+    }
+    return res.ok ? res : { ok: false, error: res.error || 'no reply' }
+  } catch (e) {
+    const msg = String(e && e.message || e)
+    if (/session/i.test(msg)) {
+      try {
+        patchRoom(roomId, r => { delete r.sessions[member.key]; return r })
+        const res = await attempt()
+        return res.ok ? res : { ok: false, error: res.error || 'no reply' }
+      } catch (e2) { return { ok: false, error: msg } }
+    }
+    return { ok: false, error: msg }
+  }
 }
 
 // ── 轮转引擎主循环 ──
