@@ -4745,6 +4745,13 @@ async function osDispatchToCeo(roomId, opts) {
   if (delivery && delivery.ok) {
     const line = String(delivery.reply || '').split('\n')[0].slice(0, 120)
     patchRoom(roomId, rm => { rm.dispatch = { workOrderId: wo.id, at: Date.now(), receipt: line }; return rm })
+    // G2 状态机事件：deliver（送出）+ ack（CEO 回执）append-only 落账，operator 留名
+    try {
+      await fetch(API + '/api/action/workorder-event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: wo.id, event: 'deliver', operator: 'os-desk', detail: '派单送达 CEO 会话' }) }).then(r => r.json()).catch(() => null)
+      await fetch(API + '/api/action/workorder-event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: wo.id, event: 'ack', operator: 'ceo', detail: line }) }).then(r => r.json()).catch(() => null)
+    } catch { /* 尽力 */ }
     appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
       text: '✅ 已派单给 CEO：工单 ' + wo.id + '（拆解执行），CEO 已回执：' + line + '。到「执行追踪」页看全链路进度。' })
     try {
@@ -5340,12 +5347,12 @@ function OsRoomView({ room, onDeleted }) {
     ] }) : null,
     eng.settled && !eng.running && room.proposalId ? jsxs('div', { className: 'osg-next', children: [
       jsxs('div', { className: 'osg-next-t', children: ['✅ 下一步：提案 ' + room.proposalId + (room.workOrderId ? ' ｜ 工单 ' + room.workOrderId : '')] }),
-      jsxs('div', { className: 'osg-next-d', children: ['合议已落定、结论已入悬决台账。① 去悬决面板推进提案阶段；② 派单给 CEO——建一张「拆解执行」工单并送达 CEO 会话，由 CEO 拆解为席位工单下达（指挥链：执行经 CEO）。'] }),
+      jsxs('div', { className: 'osg-next-d', children: ['合议已落定、结论已入悬决台账。单一入口进「执行追踪」：提案阶段推进、工单回执与席位执行进度、验收闭环全在这一页看全。'] }),
       jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
-        jsxs('button', { className: 'aod-btn', onClick: () => { try { $deckTab.set('pending'); $view.set('deck') } catch {} }, children: ['去悬决面板'] }),
+        jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: goFocus, title: '单一入口：该事项全链路（提案→工单→执行→验收）', children: ['执行追踪'] }),
         room.workOrderId
-          ? jsxs('button', { className: 'aod-btn', onClick: () => { try { $deckTab.set('tasks'); $view.set('deck') } catch {} }, children: ['已派单 ' + room.workOrderId + ' →'] })
-          : jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: dispatching,
+          ? jsxs('span', { className: 'osg-next-d', style: { margin: 0, alignSelf: 'center' }, children: ['已派单 ' + room.workOrderId + '（进度见执行追踪）'] })
+          : jsxs('button', { className: 'aod-btn', disabled: dispatching,
               onClick: async () => { setDispatching(true); const r = await osDispatchToCeo(room.roomId); setDispatching(false); if (!r.ok) { try { host.notifyError && host.notifyError('派单失败：' + r.error) } catch {} } },
               children: [dispatching ? '派单中…' : '派单给 CEO 执行'] }),
       ] }),
@@ -6193,7 +6200,7 @@ function TaskPanel() {
             (w.title || '').slice(0, 34) + ((w.title || '').length > 34 ? '…' : ''),
             w.assignedSeat || '—',
             el(Tag, { tone: priorityTone(w.priority), children: [w.priority || '—'] }),
-            el(Tag, { tone: w.status === '进行中' ? 'info' : (/终止|升级|废止/.test(String(w.status || '')) ? 'err' : 'ok'), children: [w.status || '—'] }),
+            el(Tag, { tone: w.status === '进行中' && !w.lastReply ? 'err' : w.status === '进行中' ? 'info' : (/终止|升级|废止/.test(String(w.status || '')) ? 'err' : 'ok'), children: [w.status === '进行中' && !w.lastReply ? '已派单·待回执' : (w.status || '—')] }),
             w.lastReply ? String(w.lastReply).slice(0, 26) : '—',
           ],
         })),
@@ -7083,7 +7090,7 @@ function MatterFocusPanel() {
             w.workOrderId,
             (w.title || '').slice(0, 30),
             w.assignedSeat,
-            el(Tag, { tone: w.status === '进行中' ? 'info' : (/终止|升级/.test(String(w.status || '')) ? 'err' : 'ok'), children: [w.status || '—'] }),
+            el(Tag, { tone: w.status === '进行中' && !w.lastReply ? 'err' : w.status === '进行中' ? 'info' : (/终止|升级/.test(String(w.status || '')) ? 'err' : 'ok'), children: [w.status === '进行中' && !w.lastReply ? '已派单·待回执' : (w.status || '—')] }),
             fmtD(w.deadline),
             w.lastReply ? String(w.lastReply).slice(0, 28) : '—',
           ],
