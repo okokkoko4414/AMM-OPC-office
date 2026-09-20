@@ -4123,10 +4123,20 @@ function loadOsRooms(ctx) {
     if (Array.isArray(saved)) {
       $osRooms.set(saved)
       // 自举无人值守：标记 autoResume 且未落定/未在跑的房间，插件加载后自动续跑（外部编排回灌的房间靠它接原生轮转）
+      let i = 0
       for (const r of saved) {
+        i++
         if (r.autoResume && r.engine && !r.engine.settled && !r.engine.running) {
           patchRoom(r.roomId, x => { x.autoResume = false; return x })
           setTimeout(() => { try { runOsRounds(r.roomId) } catch {} }, 3000)
+        }
+        // crash recovery：桌面重启后内存循环随旧进程死亡，running=true 的房间是僵尸态 → 续跑当前轮
+        if (r.engine && r.engine.running && !r.autoResume) {
+          setTimeout(() => { try { runOsRounds(r.roomId) } catch {} }, 4000 + i * 500)
+        }
+        // 已落定未收口且超过兜底窗（含跨重启）→ 立即补位收口
+        if (r.engine && r.engine.settled && !r.proposalId && r.engine.settledAt && Date.now() - r.engine.settledAt > OS_SETTLE_FALLBACK_MS) {
+          setTimeout(() => { osSettleFallbackChain(r.roomId).catch(() => {}) }, 6000 + i * 500)
         }
       }
       // 台账为唯一真值源（CEO 终裁原则）：加载时从服务端 hydrate 房间标记——
@@ -4553,8 +4563,9 @@ async function runOsRounds(roomId, opts) {
       }
       if (spokeInRound === 0) break  // 全员 pass → 提前 settled
     }
-    patchRoom(roomId, r => { r.engine.running = false; r.engine.settled = true; r.engine.currentSeat = null; return r })
+    patchRoom(roomId, r => { r.engine.running = false; r.engine.settled = true; r.engine.settledAt = Date.now(); r.engine.currentSeat = null; return r })
     try { host.notify && host.notify(`合议「${(getRoom(roomId) || {}).name || roomId}」已落定`) } catch {}
+    osOnSettled(roomId)
   } finally {
     osRunning.delete(roomId)
   }
@@ -4854,7 +4865,45 @@ async function osNudgeDispatch(roomId, opts) {
   return { ok: false, error: delivery.error || '催办未确认' }
 }
 
-// ══ 合议纪要归档（三层沉淀：企业台账 + 成员持久记忆 + PC1 文件层）══
+// ── 落定收口（003 合议 D-021 落地）：落定包投秘书（主路径）＋30 分钟兜底链补位（幂等永不双跑）──
+const OS_SETTLE_FALLBACK_MS = 30 * 60 * 1000
+function osOnSettled(roomId) {
+  const room = getRoom(roomId)
+  if (!room) return
+  // 落定包投秘书：记录/跟催/反馈主路径（秘书不列席，靠落定包+线头账）
+  try {
+    const ceoFinals = (room.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
+    const pack = '[落定包 · ' + room.name + ']\nroomId=' + roomId + '\n提案标记=' + (room.proposalId || '（待登记）') + '\n\nCEO 终裁（末条）：\n' + ((ceoFinals[ceoFinals.length - 1] || {}).text || '（无终裁——请先追 CEO 补终裁再登记，勿登记空结论）') + '\n\n请按 secretary-ops 执行：登记提案→归档纪要→（bootstrap 来源房）派单 CEO；30 分钟内未动作由兜底链补位（幂等）。'
+    osDeliverToSeat('amm-secretary', pack).catch(() => {})
+  } catch { /* 秘书不可达：兜底链照常 */ }
+  // 兜底链：30 分钟后检查三标记，缺则补（幂等保证与秘书永不双跑）
+  setTimeout(() => { osSettleFallbackChain(roomId) }, OS_SETTLE_FALLBACK_MS)
+}
+async function osSettleFallbackChain(roomId) {
+  const room = getRoom(roomId)
+  if (!room || !room.engine || !room.engine.settled) return
+  const done = []
+  if (!room.proposalId) {
+    const r = await osRegisterConclusion(roomId).catch(() => null)
+    if (r && r.ok) done.push('登记 ' + r.id)
+  }
+  const room2 = getRoom(roomId)
+  if (room2 && !room2.archivedId) {
+    const a = await archiveOsDeliberation(roomId).catch(() => null)
+    if (a && a.ok) done.push('归档 ' + a.id)
+  }
+  const room3 = getRoom(roomId)
+  if (room3 && room3.source && room3.source.kind === 'bootstrap' && !room3.workOrderId) {
+    const w = await osDispatchToCeo(roomId).catch(() => null)
+    if (w && w.ok) done.push('派单 ' + w.id)
+  }
+  if (done.length) {
+    appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+      text: ' 收口兜底链补位（秘书 30 分钟未动作）：' + done.join('｜') + '。经办=兜底链（幂等，未与秘书双跑）。' })
+  }
+}
+
+// ── 合议纪要归档（三层沉淀：企业台账 + 成员持久记忆 + PC1 文件层）══
 async function archiveOsDeliberation(roomId) {
   const room = getRoom(roomId)
   if (!room) return { error: 'room gone' }
@@ -8043,7 +8092,7 @@ export const __test = {
   $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
   $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
   $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
-  importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS, OS_TURN_TIMEOUT_MS, osHydrateRoomMarks,
+  importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS, OS_TURN_TIMEOUT_MS, osHydrateRoomMarks, osOnSettled, osSettleFallbackChain,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
