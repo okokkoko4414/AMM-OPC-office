@@ -4614,7 +4614,8 @@ async function importBootstrapRoom() {
   try {
     const pay = await fetch(API + '/api/bootstrap/room-payload').then(r => r.json()).catch(() => null)
     if (!pay || !pay.bootstrapId || !Array.isArray(pay.entries)) return
-    if (osFindRoomBySource('bootstrap', pay.bootstrapId)) return   // 幂等：已导入不重复建
+    const dup = osFindRoomBySource('bootstrap', pay.bootstrapId)
+    if (dup) return dup   // 幂等：已导入（含 register 时已消费真实载荷的场景）——返回既有房间，不重复建
     const members = osSortMembers(SEATS.map(s => ({ key: 'pc2:' + s, name: s, seat: s, label: s, machine: 'pc2' })))
     const room = createOsRoom({ name: pay.roomName || '外部合议', members, maxRounds: 3, source: { kind: 'bootstrap', id: pay.bootstrapId } })
     appendOsLog(room.roomId, { from: { kind: 'user', seat: 'boss', label: '峰哥' }, round: 0,
@@ -4638,7 +4639,10 @@ async function importBootstrapRoom() {
     })
     setTimeout(() => { try { runOsRounds(room.roomId) } catch {} }, 3000)
     return room
-  } catch { /* 快照服务不可达：下次加载重试 */ }
+  } catch (e) {
+    try { console.error('[importBootstrapRoom]', e && e.message || e) } catch {}
+    /* 快照服务不可达：下次加载重试 */
+  }
 }
 
 // 登记结论为提案（幂等核心，UI 按钮调它）：房间级幂等 + 服务端去重双保险；失败明示原因
