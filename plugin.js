@@ -4620,8 +4620,9 @@ async function osRegisterConclusion(roomId) {
   return { ok: true, id: r.id }
 }
 
-// 派单给 CEO（幂等）：建 1 张「拆解执行」工单 + 直通送达 CEO 会话（指挥链：执行单经 CEO 下达，不越级直派席位）
-async function osDispatchToCeo(roomId) {
+// 派单给 CEO（幂等）：建 1 张「拆解执行」工单 + 送达并等回执（指挥链：执行单经 CEO 下达，不越级直派席位）
+// 三态如实：已回执 / 已送达等回执 / 送达未确认——绝不静默吞（09-20 实锤：fire-and-forget 让 UI 说谎）
+async function osDispatchToCeo(roomId, opts) {
   const room = getRoom(roomId)
   if (!room) return { ok: false, error: 'room gone' }
   if (!room.proposalId) return { ok: false, error: '请先登记结论为提案' }
@@ -4636,12 +4637,30 @@ async function osDispatchToCeo(roomId) {
   }) }).then(r => r.json()).catch(() => null)
   if (!wo || !wo.ok) return { ok: false, error: (wo && wo.error) || '快照服务不可达（8901）' }
   patchRoom(roomId, rm => { rm.workOrderId = wo.id; return rm })
-  try {
-    await osDeliverToSeat('ceo', '[AMM OPC 工单 ' + wo.id + ' · 合议执行拆解]\n提案：' + room.proposalId + '（' + payload.title + '）\n\n合议结论：\n' + payload.fiveItems + '\n\n【你的任务】按合议结论拆解为各席位工单并逐一送达（指挥链：执行单经你下达）。回执一行：「已受理」或「缺件：<缺什么>」。')
-  } catch { /* 送达失败不阻塞「工单已建」事实，任务面板可补送 */ }
-  appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
-    text: '📮 已派单给 CEO：工单 ' + wo.id + '（拆解执行）已送达 CEO 会话。后续到指挥台 · 任务面板跟踪。' })
-  return { ok: true, id: wo.id }
+  const text = '[AMM OPC 工单 ' + wo.id + ' · 合议执行拆解]\n提案：' + room.proposalId + '（' + payload.title + '）\n\n合议结论：\n' + payload.fiveItems + '\n\n【你的任务】按合议结论拆解为各席位工单并逐一送达（指挥链：执行单经你下达；子单 source 需含 ' + room.proposalId + '）。回执一行：「已受理」或「缺件：<缺什么>」。'
+  const deliverFn = (opts && opts.deliver) || osDeliverAndAwait
+  let delivery
+  try { delivery = await deliverFn('ceo', text, 120000) } catch (e) { delivery = { ok: false, error: String(e && e.message || e) } }
+  if (delivery && delivery.ok) {
+    const line = String(delivery.reply || '').split('\n')[0].slice(0, 120)
+    patchRoom(roomId, rm => { rm.dispatch = { workOrderId: wo.id, at: Date.now(), receipt: line }; return rm })
+    appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+      text: '✅ 已派单给 CEO：工单 ' + wo.id + '（拆解执行），CEO 已回执：' + line + '。到「执行追踪」页看全链路进度。' })
+    try {
+      await fetch(API + '/api/action/workorder-reply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: wo.id, reply: '已送达且回执：' + line, repliedBy: 'os-desk' }) }).then(r => r.json()).catch(() => null)
+    } catch { /* 尽力 */ }
+  } else {
+    const err = (delivery && delivery.error) || '送达未确认'
+    patchRoom(roomId, rm => { rm.dispatch = { workOrderId: wo.id, at: Date.now(), receipt: null, error: err }; return rm })
+    appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+      text: '⚠️ 工单 ' + wo.id + ' 已创建，但送达未确认（' + err + '）。到「执行追踪」页可催办重发。' })
+    try {
+      await fetch(API + '/api/action/workorder-reply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: wo.id, reply: '送达未确认：' + err, repliedBy: 'os-desk' }) }).then(r => r.json()).catch(() => null)
+    } catch { /* 尽力 */ }
+  }
+  return { ok: true, id: wo.id, receipt: delivery && delivery.ok ? delivery.reply : null }
 }
 
 // 从提案/工单一键发起合议（悬决面板/任务面板「发起合议」按钮调用）
@@ -4675,6 +4694,56 @@ async function osDeliverToSeat(seat, text) {
     await requestForBot(bot, 'prompt.submit', { session_id: chat.runtime, text })
   })
   return true
+}
+
+// ── 送达回执闭环：投递后轮询席位会话拿 assistant 回执（「已受理/缺件」契约）——
+// 之前 fire-and-forget，投递失败被静默吞、UI 照写「已送达」（09-20 实锤）══
+async function osAwaitReceipt(member, chatRuntime, baseLen, timeoutMs, pollMs) {
+  const step = pollMs || 5000
+  const limit = timeoutMs || 120000
+  const deadline = Date.now() + limit
+  for (;;) {
+    const r = await requestForBot(member, 'session.resume', { session_id: chatRuntime }).catch(() => null)
+    const msgs = (r && (r.messages || r.history)) || []
+    const rep = [...msgs.slice(baseLen)].reverse().find(m => m && (m.role === 'assistant' || m.kind === 'assistant') && (m.text || m.content))
+    if (rep) return { ok: true, reply: String(rep.text || rep.content).slice(0, 300) }
+    if (Date.now() + step > deadline) return { ok: false, error: '送达超时（' + Math.round(limit / 1000) + 's 无回执）' }
+    await new Promise(res => setTimeout(res, step))
+  }
+}
+
+async function osDeliverAndAwait(seat, text, timeoutMs, pollMs) {
+  const bot = { name: seat }
+  const chat = await ensureBotChat(bot)
+  if (!chat || !chat.runtime) throw new Error('无法打开席位会话')
+  const before = await requestForBot(bot, 'session.resume', { session_id: chat.runtime }).catch(() => null)
+  const baseLen = ((before && (before.messages || before.history)) || []).length
+  await withBotLease(bot, async () => {
+    await requestForBot(bot, 'prompt.submit', { session_id: chat.runtime, text })
+  })
+  return osAwaitReceipt(bot, chat.runtime, baseLen, timeoutMs, pollMs)
+}
+
+// 催办：对在途工单重发一行催办并等回执（幂等——一次一催，不轰炸）
+async function osNudgeDispatch(roomId, opts) {
+  const room = getRoom(roomId)
+  if (!room || !room.workOrderId) return { ok: false, error: '无在途工单可催' }
+  const payload = osConcludeToProposal(roomId)
+  const text = '[催办 · AMM OPC 工单 ' + room.workOrderId + ' · 合议执行拆解]\n提案：' + (room.proposalId || '') + '\n\n合议结论：\n' + (payload ? payload.fiveItems : '') + '\n\n【催办】请回执一行「已受理」或「缺件：<缺什么>」，并尽快拆解为席位工单。'
+  const deliverFn = (opts && opts.deliver) || osDeliverAndAwait
+  let delivery
+  try { delivery = await deliverFn('ceo', text, 120000) } catch (e) { delivery = { ok: false, error: String(e && e.message || e) } }
+  if (delivery.ok) {
+    const line = String(delivery.reply || '').split('\n')[0].slice(0, 120)
+    appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+      text: '✅ 催办已送达，CEO 回执：' + line })
+    try {
+      await fetch(API + '/api/action/workorder-reply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: room.workOrderId, reply: '催办回执：' + line, repliedBy: 'os-desk' }) }).then(r => r.json()).catch(() => null)
+    } catch { /* 尽力 */ }
+    return { ok: true, reply: delivery.reply }
+  }
+  return { ok: false, error: delivery.error || '催办未确认' }
 }
 
 // ══ 合议纪要归档（三层沉淀：企业台账 + 成员持久记忆 + PC1 文件层）══
@@ -5117,9 +5186,10 @@ function OsRoomView({ room, onDeleted }) {
     osGrillClose(false)
     sendOsUserMessage(room.roomId, t)
   }
+  const goFocus = () => { try { goFocusMatter(room.proposalId, room.roomId) } catch {} }
   const conclude = async () => {
-    if (room.proposalId) {   // 幂等：已登记过 → 不再建提案，直接带路去悬决面板
-      try { $deckTab.set('pending'); $view.set('deck') } catch {}
+    if (room.proposalId) {   // 幂等：已登记过 → 不再建提案，直达执行追踪
+      goFocus()
       return
     }
     setConcluding(true)
@@ -5147,8 +5217,8 @@ function OsRoomView({ room, onDeleted }) {
         eng.running ? jsxs('button', { className: 'aod-btn aod-btn-danger', onClick: () => stopOsRounds(room.roomId), children: ['停止'] }) : null,
         eng.settled && !eng.running ? jsxs(Fragment, { children: [
           jsxs('button', { className: 'aod-btn', onClick: () => runOsRounds(room.roomId, { extraRounds: 3 }), children: ['+3 轮续场'] }),
-          jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: concluding,
-            title: room.proposalId ? '已登记（提案 ' + room.proposalId + '），点击去悬决面板' : '把合议结论写入悬决台账（生成提案号，幂等不重复）',
+          jsxs('button', { className: 'aod-btn' + (room.proposalId ? '' : ' aod-btn-pri'), disabled: concluding,
+            title: room.proposalId ? '已登记（提案 ' + room.proposalId + '），点击打开执行追踪' : '把合议结论写入悬决台账（生成提案号，幂等不重复）',
             onClick: conclude,
             children: [concluding ? '登记中…' : room.proposalId ? '已登记 ' + room.proposalId + ' →' : '登记结论为提案'] }),
           jsx('button', { className: 'aod-btn', disabled: archiving, title: '落台账 + 写 PC1 纪要文件 + 通知全部成员', onClick: async () => { setArchiving(true); const r = await archiveOsDeliberation(room.roomId); setArchiving(false); if (r && r.error) { try { host.notifyError && host.notifyError('归档失败：' + r.error) } catch {} } }, children: [archiving ? '归档中…' : '归档纪要'] }),
@@ -5421,6 +5491,7 @@ const PROPOSAL_STAGES = ['提案中', '事实收集中', '方案比选中', '合
 const EXPENSE_CATEGORIES = ['人力', '场地', '折旧', '运营', '采购', '其他']
 
 const TABS = [
+  { id: 'focus', label: '执行追踪' },
   { id: 'pending', label: '悬决' },
   { id: 'tasks', label: '任务' },
   { id: 'acceptance', label: '验收' },
@@ -5476,6 +5547,13 @@ const CSS = `
 .aod-kv{display:flex;gap:10px;padding:6px 0;border-bottom:1px dashed rgba(128,128,128,.15);font-size:12.5px}
 .aod-kv-k{width:92px;flex:none;opacity:.6}
 .aod-kv-v{flex:1;word-break:break-all;white-space:pre-wrap}
+.aod-steps{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.aod-step{flex:1;min-width:140px;border:1px solid rgba(128,128,128,.35);border-radius:8px;padding:8px 10px}
+.aod-step.done{border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
+.aod-step.doing{border-color:rgba(210,153,34,.65);background:rgba(210,153,34,.1)}
+.aod-step.pending{opacity:.55}
+.aod-step-t{font-weight:700;font-size:12.5px;margin-bottom:2px}
+.aod-step-n{font-size:11.5px;opacity:.78;line-height:1.5}
 .aod-form{margin-top:14px;border-top:1px solid rgba(128,128,128,.25);padding-top:12px}
 .aod-form-title{font-weight:600;margin-bottom:10px;font-size:13px}
 .aod-field{display:block;margin-bottom:10px}
@@ -5504,7 +5582,7 @@ function injectDeskCss() {
 // ══════════════════════════════════════════════════════════
 // Hooks
 // ══════════════════════════════════════════════════════════
-function useFetch(url) {
+function useFetch(url, intervalMs) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -5517,6 +5595,11 @@ function useFetch(url) {
       .catch(e => { if (alive) { setLoading(false); setError(String(e && e.message || e)) } })
     return () => { alive = false }
   }, [url, tick])
+  useEffect(() => {
+    if (!intervalMs) return undefined
+    const t = setInterval(() => setTick(x => x + 1), intervalMs)
+    return () => clearInterval(t)
+  }, [intervalMs])
   return { data, loading, error, refresh: () => setTick(t => t + 1) }
 }
 
@@ -5678,6 +5761,30 @@ const yuanToCents = v => {
 // ══════════════════════════════════════════════════════════
 // 面板 1：悬决清单
 // ══════════════════════════════════════════════════════════
+// 最近登记区块（含已裁定）：登记完的提案不再从「待决提案」视图里消失（09-20 峰哥反馈断链修复）
+function RecentProposalsCard({ onOpen }) {
+  const allP = useFetch(API + '/api/ledger/proposals')
+  const recent = (Array.isArray(allP.data) ? allP.data : []).slice()
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+    .slice(0, 5)
+  return el(Card, { title: '最近登记（含已裁定 · 点击开详情；全链路看「执行追踪」）', children: [
+    el(Tbl, {
+      cols: ['提案号', '标题', '阶段', '登记时间'],
+      empty: allP.loading ? '加载中…' : '暂无提案',
+      items: recent.map(p => ({
+        key: p.proposalId,
+        onClick: () => onOpen(p),
+        cells: [
+          p.proposalId,
+          p.title,
+          el(Tag, { tone: stageTone(p.currentStage), children: [p.currentStage] }),
+          fmtDT(p.createdAt),
+        ],
+      })),
+    }),
+  ] })
+}
+
 function PendingPanel() {
   const { data, loading, error, refresh } = useFetch(API + '/api/ledger/pending')
   const { busy, msg, run } = useAction()
@@ -5708,6 +5815,8 @@ function PendingPanel() {
       el(Stat, { label: '待决升级单', value: s.pendingEscalations || 0 }),
       el(Stat, { label: '未销号承诺', value: s.openCommitments || 0, tone: 'err' }),
     ] }),
+
+    el(RecentProposalsCard, { onOpen: p => setSel({ kind: 'proposal', item: p }) }),
 
     showNew ? el(Card, { title: '发起提案（八步议事 · 提案中）', children: [
       el(ActionForm, {
@@ -5966,6 +6075,26 @@ function TaskPanel() {
       }),
       el(Msg, { msg: msg }),
     ] }) : null,
+
+    // 本地工单（置顶全可见——之前只计数不渲染，WO 淹没在 paperclip 里找不到）
+    el(Card, { title: '本地工单（' + localAll.length + ' · 全部可见，新单在前）', children: [
+      el(Tbl, {
+        cols: ['工单号', '标题', '派给', '优先级', '状态', '最近回执'],
+        empty: '无本地工单',
+        items: localAll.slice().reverse().map(w => ({
+          key: w.workOrderId,
+          onClick: () => setSel(w),
+          cells: [
+            w.workOrderId,
+            (w.title || '').slice(0, 34) + ((w.title || '').length > 34 ? '…' : ''),
+            w.assignedSeat || '—',
+            el(Tag, { tone: priorityTone(w.priority), children: [w.priority || '—'] }),
+            el(Tag, { tone: w.status === '进行中' ? 'info' : (/终止|升级|废止/.test(String(w.status || '')) ? 'err' : 'ok'), children: [w.status || '—'] }),
+            w.lastReply ? String(w.lastReply).slice(0, 26) : '—',
+          ],
+        })),
+      }),
+    ] }),
 
     // 四栏（paperclip issues by bucket）
     el('div', { className: 'aod-grid2', children: KANBAN_BUCKETS.map(b =>
@@ -6711,6 +6840,7 @@ function SearchPanel() {
 // 主页面 + 注册
 // ══════════════════════════════════════════════════════════
 const PANELS = {
+  focus: MatterFocusPanel,
   pending: PendingPanel,
   tasks: TaskPanel,
   acceptance: AcceptancePanel,
@@ -6722,6 +6852,160 @@ const PANELS = {
 
 // 指挥台当前面板（全局 atom：群聊引导卡等外部入口可深链到指定面板，如 $deckTab.set('pending')）
 const $deckTab = atom('pending')
+// 执行追踪聚焦事项（全局 atom：{proposalId, roomId}——群聊引导卡深链定点，回答「这件事现在到哪一步、我下一步做什么」）
+const $matterFocus = atom(null)
+
+// ── 事项链路聚合（纯函数，可测）：提案 ↔ 工单（source 含 proposalId）↔ 子单完成度 ──
+function matterChain(p, workorders) {
+  if (!p) return { main: null, subs: [], subsDone: 0 }
+  const rel = (workorders || []).filter(w => w && String(w.source || '').includes(p.proposalId))
+  const main = rel.find(w => String(w.assignedSeat || '') === 'ceo') || rel[0] || null
+  const subs = rel.filter(w => w !== main)
+  const isDone = w => /完成|交付|闭环|已销/.test(String((w && w.status) || ''))
+  return { main, subs, subsDone: subs.filter(isDone).length }
+}
+// 下一步规则（四态）：派单 → 等回执/拆解 → 席位执行(n/m) → 验收闭环
+function nextAction(p, chain) {
+  if (!p) return null
+  if (!chain.main) return { kind: 'dispatch', label: '派单给 CEO 执行' }
+  if (!chain.main.lastReply && !chain.subs.length) return { kind: 'await', label: '等待 CEO 回执 / 拆解' }
+  if (chain.subs.length && chain.subsDone < chain.subs.length) return { kind: 'exec', label: '席位执行中（' + chain.subsDone + '/' + chain.subs.length + ' 完成）' }
+  if (chain.subs.length && chain.subsDone === chain.subs.length) return { kind: 'accept', label: '子单全部完成，可验收闭环' }
+  return { kind: 'await', label: '等待 CEO 拆解' }
+}
+// 深链定点：合议群引导卡/任何入口 → 聚焦该事项并切到执行追踪
+function goFocusMatter(proposalId, roomId) {
+  try { $matterFocus.set({ proposalId: proposalId || null, roomId: roomId || null }) } catch {}
+  try { $deckTab.set('focus') } catch {}
+  try { $view.set('deck') } catch {}
+}
+
+// 催办（desk 侧轻投递）：对 CEO 重发一行催办并等回执（依赖 merged 的 osDeliverAndAwait；standalone 降级为报错提示）
+async function focusNudge(focus, chain) {
+  const wo = chain && chain.main ? chain.main.workOrderId : null
+  const text = '[催办 · AMM OPC ' + (wo ? '工单 ' + wo : '提案 ' + (focus && focus.proposalId)) + ' · 合议执行拆解]\n请回执一行「已受理」或「缺件：<缺什么>」，并尽快拆解为席位工单（source 需含 ' + (focus && focus.proposalId) + '）。'
+  try { return await osDeliverAndAwait('ceo', text, 120000) } catch (e) { return { ok: false, error: String(e && e.message || e) } }
+}
+
+function MatterFocusPanel() {
+  const focus = useValue($matterFocus)
+  const allP = useFetch(API + '/api/ledger/proposals', 10000)
+  const wos = useFetch(API + '/api/ledger/workorders', 10000)
+  const { busy, msg, run } = useAction()
+  const [nudging, setNudging] = useState(false)
+
+  const recent = (Array.isArray(allP.data) ? allP.data : []).slice()
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+
+  if (!focus || !focus.proposalId) {
+    return el('div', { children: [
+      el('div', { className: 'aod-head', children: [
+        el('div', { children: [
+          el('h1', { className: 'aod-h1', children: ['执行追踪'] }),
+          el('div', { className: 'aod-sub', children: ['单一事项全链路：提案 → 派单 → 执行 → 闭环 · 从合议群引导卡进入自动聚焦'] }),
+        ] }),
+      ] }),
+      el(Card, { title: '最近事项（点击 → 聚焦追踪）', children: [
+        el(Tbl, {
+          cols: ['提案号', '标题', '阶段', '登记时间'],
+          empty: allP.loading ? '加载中…' : '暂无提案——先在合议群「登记结论为提案」',
+          items: recent.slice(0, 6).map(p => ({
+            key: p.proposalId,
+            onClick: () => $matterFocus.set({ proposalId: p.proposalId, roomId: null }),
+            cells: [p.proposalId, p.title, el(Tag, { tone: stageTone(p.currentStage), children: [p.currentStage] }), fmtDT(p.createdAt)],
+          })),
+        }),
+      ] }),
+    ] })
+  }
+
+  const p = recent.find(x => x && x.proposalId === focus.proposalId) || null
+  const anchorRoom = p && /合议群\s+([a-z0-9-]+)/i.exec(String(p.targetAnchor || ''))
+  const roomId = focus.roomId || (anchorRoom ? anchorRoom[1] : null)
+  const chain = matterChain(p, Array.isArray(wos.data) ? wos.data : [])
+  const act = nextAction(p, chain)
+  const stageIdx = p ? PROPOSAL_STAGES.indexOf(p.currentStage) : -1
+  const nextStage = p && stageIdx >= 0 && stageIdx < PROPOSAL_STAGES.length - 1 ? PROPOSAL_STAGES[stageIdx + 1] : null
+
+  const steps = [
+    p ? { label: '提案登记', state: 'done', note: p.proposalId + ' · ' + p.currentStage } : { label: '提案登记', state: 'pending', note: '' },
+    chain.main
+      ? { label: '派单 CEO', state: chain.main.lastReply ? 'done' : 'doing',
+          note: chain.main.lastReply ? '回执：' + String(chain.main.lastReply).slice(0, 36) : fmtDT(chain.main.createdAt) + ' 派出 · 未回执' + stuckMinutes(chain.main.createdAt) }
+      : { label: '派单 CEO', state: 'pending', note: '' },
+    chain.subs.length
+      ? { label: '席位执行', state: chain.subsDone === chain.subs.length ? 'done' : 'doing', note: chain.subsDone + '/' + chain.subs.length + ' 子单完成' }
+      : { label: '席位执行', state: 'pending', note: '' },
+    chain.subs.length && chain.subsDone === chain.subs.length
+      ? { label: '验收闭环', state: 'done', note: '可闭环' }
+      : { label: '验收闭环', state: 'pending', note: '' },
+  ]
+
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['执行追踪'] }),
+        el('div', { className: 'aod-sub', children: [(p ? p.proposalId + ' · ' : '') + (p ? p.title : '提案加载中…') + '（10s 自动刷新）'] }),
+      ] }),
+      el('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+        roomId ? el(Btn, { onClick: () => { try { $osActiveRoom.set(roomId); $view.set('chat') } catch {} }, children: ['回·合议群'] }) : null,
+      ] }),
+    ] }),
+
+    el('div', { className: 'aod-steps', children: steps.map((s, i) =>
+      el('div', { key: 'step' + i, className: 'aod-step ' + s.state, children: [
+        el('div', { className: 'aod-step-t', children: [(s.state === 'done' ? '✅ ' : s.state === 'doing' ? '● ' : '○ ') + s.label] }),
+        el('div', { className: 'aod-step-n', children: [s.note || '—'] }),
+      ] })) }),
+
+    el(Card, { title: '合议结论（' + (p ? p.proposalId : '…') + '）', children: [
+      el('div', { className: 'aod-kv', children: [
+        el('span', { className: 'aod-kv-k', children: ['结论摘要'] }),
+        el('span', { className: 'aod-kv-v', children: [p && p.fiveItems ? p.fiveItems : '（无）'] }),
+      ] }),
+      nextStage ? el('div', { className: 'aod-btnrow', children: [
+        el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: focus.proposalId, newStage: nextStage }, () => allP.refresh()), children: ['推进至「' + nextStage + '」'] }),
+      ] }) : null,
+      el(Msg, { msg: msg }),
+    ] }),
+
+    chain.main ? el(Card, { title: '执行工单 ' + chain.main.workOrderId + (chain.subs.length ? '（子单 ' + chain.subsDone + '/' + chain.subs.length + ' 完成）' : ''), children: [
+      el(Tbl, {
+        cols: ['工单号', '标题', '派给', '状态', '截止', '最近回执'],
+        empty: '—',
+        items: [chain.main, ...chain.subs].map(w => ({
+          key: w.workOrderId,
+          cells: [
+            w.workOrderId,
+            (w.title || '').slice(0, 30),
+            w.assignedSeat,
+            el(Tag, { tone: w.status === '进行中' ? 'info' : (/终止|升级/.test(String(w.status || '')) ? 'err' : 'ok'), children: [w.status || '—'] }),
+            fmtD(w.deadline),
+            w.lastReply ? String(w.lastReply).slice(0, 28) : '—',
+          ],
+        })),
+      }),
+    ] }) : null,
+
+    act ? el(Card, { title: '下一步', children: [
+      el('div', { className: 'aod-note', children: ['当前状态：' + act.label] }),
+      el('div', { className: 'aod-btnrow', children: [
+        act.kind === 'dispatch' && roomId ? el(Btn, { kind: 'pri', disabled: busy, onClick: () => { try { osDispatchToCeo(roomId); allP.refresh(); wos.refresh() } catch {} }, children: ['派单给 CEO 执行'] }) : null,
+        act.kind === 'await' ? el(Btn, { kind: 'pri', disabled: nudging, onClick: async () => { setNudging(true); const r = await focusNudge(focus, chain); setNudging(false); try { host.notify && host.notify(r.ok ? '催办已送达，CEO 已回执' : '催办未确认：' + (r.error || '')) } catch {} }, children: [nudging ? '催办中…' : '催办重发（等回执）'] }) : null,
+        act.kind === 'accept' ? el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: focus.proposalId, newStage: '已裁定' }, () => allP.refresh()), children: ['验收并闭环'] }) : null,
+        act.kind === 'exec' ? el('span', { className: 'aod-note', children: ['执行明细见上方工单卡；子单完成会自动亮起验收。'] }) : null,
+      ] }),
+    ] }) : null,
+  ] })
+}
+
+// 卡住时长提示（派单超过 10 分钟未回执才显示，避免刚点完就红）
+function stuckMinutes(createdAt) {
+  const t = Date.parse(String(createdAt || '').replace(' ', 'T'))
+  if (isNaN(t)) return ''
+  const mins = Math.floor((Date.now() - t) / 60000)
+  return mins >= 10 ? ' · 已 ' + mins + ' 分钟' : ''
+}
 
 function DeskHome() {
   const tab = useValue($deckTab)
@@ -7646,6 +7930,7 @@ export const __test = {
   DeskHome, PendingPanel, TaskPanel,
   $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
   $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
+  $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
