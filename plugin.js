@@ -4119,7 +4119,16 @@ function loadOsRooms(ctx) {
   osRoomsCtx = ctx
   try {
     const saved = ctx.storage?.get?.(OS_ROOMS_KEY, null)
-    if (Array.isArray(saved)) $osRooms.set(saved)
+    if (Array.isArray(saved)) {
+      $osRooms.set(saved)
+      // 自举无人值守：标记 autoResume 且未落定/未在跑的房间，插件加载后自动续跑（外部编排回灌的房间靠它接原生轮转）
+      for (const r of saved) {
+        if (r.autoResume && r.engine && !r.engine.settled && !r.engine.running) {
+          patchRoom(r.roomId, x => { x.autoResume = false; return x })
+          setTimeout(() => { try { runOsRounds(r.roomId) } catch {} }, 3000)
+        }
+      }
+    }
   } catch { /* no storage */ }
 }
 function saveOsRooms() {
@@ -4593,6 +4602,40 @@ function osConcludeToProposal(roomId) {
 function osFindRoomBySource(kind, id) {
   if (!id) return null
   return ($osRooms.get() || []).find(r => r.source && r.source.kind === kind && r.source.id === id) || null
+}
+
+// ── 外部编排合议回灌（自举通道）：快照服务上的议题载荷 → 真实合议群房间 ──
+// 09-20 峰哥裁定：自举合议必须在群聊里原生轮转，CLI 广播式编排只算 R1/R2 素材——
+// 回灌为房间历史（标注通道差异），CEO 终裁起由引擎原生接跑（autoResume 无人值守）。
+async function importBootstrapRoom() {
+  try {
+    const pay = await fetch(API + '/api/bootstrap/room-payload').then(r => r.json()).catch(() => null)
+    if (!pay || !pay.bootstrapId || !Array.isArray(pay.entries)) return
+    if (osFindRoomBySource('bootstrap', pay.bootstrapId)) return   // 幂等：已导入不重复建
+    const members = osSortMembers(SEATS.map(s => ({ key: 'pc2:' + s, name: s, seat: s, label: s, machine: 'pc2' })))
+    const room = createOsRoom({ name: pay.roomName || '外部合议', members, maxRounds: 3, source: { kind: 'bootstrap', id: pay.bootstrapId } })
+    appendOsLog(room.roomId, { from: { kind: 'user', seat: 'boss', label: '峰哥' }, round: 0,
+      text: '【自举合议·议题】' + (pay.topicBrief || pay.roomName || '') + '。议题全文见 factory_assets/amm-opc-decision-hub/bootstrap/。以下 R1/R2 经外部编排通道完成（非本群原生发言，通道差异如实标注），自 CEO 终裁起在本群原生轮转。' })
+    let lastRound = 0
+    for (const e of pay.entries) {
+      if (e.round !== lastRound) {
+        appendOsLog(room.roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: e.round - 1,
+          text: '—— Round ' + e.round + '（外部编排通道转写）——' })
+        lastRound = e.round
+      }
+      appendOsLog(room.roomId, { from: { kind: 'member', seat: e.seat, label: e.seat }, round: e.round - 1, text: e.text })
+    }
+    appendOsLog(room.roomId, { from: { kind: 'user', seat: 'boss', label: '峰哥' }, round: 2,
+      text: '【峰哥】R1/R2 已完成（外部编排通道转写）。@ceo 请压轴终裁五件套：【方案】【拆解要点】【验收标准与清单（UX 类标「需峰哥」）】【证据级】【动作量】。' })
+    const logLen = (getRoom(room.roomId).log || []).length
+    patchRoom(room.roomId, r => {
+      for (const m of r.members) r.watermarks[m.key] = (m.seat === 'ceo' ? 0 : logLen)   // CEO 从头见全部，其余已「看过」
+      r.engine.round = 2; r.engine.settled = false; r.autoResume = true
+      return r
+    })
+    setTimeout(() => { try { runOsRounds(room.roomId) } catch {} }, 3000)
+    return room
+  } catch { /* 快照服务不可达：下次加载重试 */ }
 }
 
 // 登记结论为提案（幂等核心，UI 按钮调它）：房间级幂等 + 服务端去重双保险；失败明示原因
@@ -7834,6 +7877,7 @@ const plugin = {
     injectOsShellCss()
     injectDeskCss()
     loadOsRooms(ctx)
+    importBootstrapRoom()
 
     try {
       const seats = ctx.storage?.get?.('seats', null)
@@ -7931,6 +7975,7 @@ export const __test = {
   $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
   $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
   $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
+  importBootstrapRoom,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
