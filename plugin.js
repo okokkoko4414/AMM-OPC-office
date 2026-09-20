@@ -4109,6 +4109,7 @@ const OS_MAX_ROUNDS_LIMIT = 12
 const OS_LOG_LIMIT = 200          // 每房滚动 retention
 const OS_HISTORY_LINES = 24       // 注入协议时携带的新消息上限
 const OS_TURN_TIMEOUT_MS = 300000 // 成员发言超时（长输出任务如执行清单可达数分钟）
+const OS_DIRECTED_TIMEOUT_MS = 600000 // @点名定向轮超时（指名任务=终裁/执行清单，大上下文长输出给双倍预算；09-20 CEO 终裁 297s 被掐实证）
 const OS_RESUME_POLL_MS = 5000
 const OS_PARALLEL_CHUNK = 3       // 全员并行限流（防 8 席冷启动风暴）；组内乱序完成、按成员序入账
 
@@ -4316,7 +4317,7 @@ function osHandleGatewayEvent(ev) {
     }
   }
 }
-function osWaitForTurn(member, roomId, sessionIds, baselineCount, waiter, waiterPromise) {
+function osWaitForTurn(member, roomId, sessionIds, baselineCount, waiter, waiterPromise, timeoutMs) {
   return new Promise((resolve) => {
     let done = false
     let resumeFails = 0
@@ -4343,15 +4344,16 @@ function osWaitForTurn(member, roomId, sessionIds, baselineCount, waiter, waiter
       }
     }, OS_RESUME_POLL_MS)
     const to = setTimeout(() => {
-      // 超时即 interrupt 杀僵尸轮次——不杀的话下一投会撞 busy 排队，连锁超时
+      // 超时即 interrupt 杀僵尸轮次——不杀的话下一投会撞 busy 排队
       try { requestForBot(member, 'session.interrupt', { session_id: sessionIds.runtime }).catch(() => null) } catch { /* 尽力 */ }
       finish({ ok: false, error: 'timeout' })
-    }, OS_TURN_TIMEOUT_MS)
+    }, timeoutMs || OS_TURN_TIMEOUT_MS)
   })
 }
 
 // ── 给单个成员投递一轮发言并取回复 ──
-async function osMemberSpeak(roomId, member) {
+async function osMemberSpeak(roomId, member, opts) {
+  const timeoutMs = (opts && opts.timeoutMs) || OS_TURN_TIMEOUT_MS
   const room = getRoom(roomId)
   if (!room) return { ok: false, error: 'room gone' }
   const newMsgs = osNewMessages(room, member.key)
@@ -4405,7 +4407,7 @@ async function osMemberSpeak(roomId, member) {
         osTurnWaiters.delete(waiter.key)
         throw e
       }
-      const res = await osWaitForTurn(member, roomId, sess, baseline, waiter, promise)
+      const res = await osWaitForTurn(member, roomId, sess, baseline, waiter, promise, timeoutMs)
       // 失败时记下基线——下轮先 drain 迟到回复再投新 prompt（防 stale 错认）
       if (!res.ok) patchRoom(roomId, r => { r.engine.pendingLate = { ...(r.engine.pendingLate || {}), [member.key]: baseline }; return r })
       return res.ok ? { ok: true, text: String(res.text || '').slice(0, 1200) } : { ok: false, error: res.error || 'no reply' }
@@ -4480,9 +4482,10 @@ async function runOsRounds(roomId, opts) {
       }
       if (directed) {
         // 定向：按 @mention 出现顺序串行（后发言者能看到先发言者的本轮立场，路由依赖场景）
+        // 指名任务（终裁/执行清单）是大上下文长输出——双倍超时预算（09-20 CEO 终裁 297s 被掐实证）
         for (const member of responders) {
           if (!guard()) break
-          spokeInRound += postResult(member, await osMemberSpeak(roomId, member))
+          spokeInRound += postResult(member, await osMemberSpeak(roomId, member, { timeoutMs: OS_DIRECTED_TIMEOUT_MS }))
         }
       } else {
         // 全员：chunk 并行执行、组内乱序完成后按成员序入账
@@ -5249,7 +5252,7 @@ function OsRoomView({ room, onDeleted }) {
         jsxs('div', { className: 'osg-room-sub', children: [
           room.members.map(m => m.label).join(' · '),
           '　｜　轮次上限 ' + (room.maxRounds || OS_DEFAULT_ROUNDS),
-          room.source && room.source.kind && room.source.kind !== 'manual' ? '　｜　来源：' + (room.source.kind === 'proposal' ? '提案 ' : '工单 ') + room.source.id : '',
+          room.source && room.source.kind && room.source.kind !== 'manual' ? '　｜　来源：' + (room.source.kind === 'proposal' ? '提案 ' : room.source.kind === 'bootstrap' ? '自举议题 ' : '工单 ') + room.source.id : '',
         ] }),
       ] }),
       jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
@@ -7975,7 +7978,7 @@ export const __test = {
   $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
   $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
   $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
-  importBootstrapRoom,
+  importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
