@@ -4110,6 +4110,7 @@ const OS_LOG_LIMIT = 200          // 每房滚动 retention
 const OS_HISTORY_LINES = 24       // 注入协议时携带的新消息上限
 const OS_TURN_TIMEOUT_MS = 300000 // 成员发言超时（长输出任务如执行清单可达数分钟）
 const OS_RESUME_POLL_MS = 5000
+const OS_PARALLEL_CHUNK = 3       // 全员并行限流（防 8 席冷启动风暴）；组内乱序完成、按成员序入账
 
 // ── 房间 atom 与持久化 ──
 const $osRooms = atom([])
@@ -4145,6 +4146,17 @@ function mintOsRoomId() {
 function isOsPass(text) {
   if (!text) return true
   return /^\(?\s*pass\s*\)?\.?$/i.test(String(text).trim())
+}
+// 发言顺序约束：独立评审判据前置 → 其余席位 → CEO 压轴裁定（rank 内保持原序，稳定排序）
+function osSortMembers(members) {
+  const rank = m => /independent-reviewer/i.test(String((m && m.seat) || '')) ? 0 : (String((m && m.seat) || '') === 'ceo' ? 2 : 1)
+  return (members || []).map((m, i) => ({ m, i })).sort((a, b) => (rank(a.m) - rank(b.m)) || (a.i - b.i)).map(x => x.m)
+}
+// 防嵌套命名：递归剥掉「合议：」「合议结论：」前缀（结论提案再发起合议不会出现「合议：合议结论：…」）
+function stripOsTitlePrefix(t) {
+  let s = String(t || '')
+  while (/^合议(结论)?：/.test(s)) s = s.replace(/^合议(结论)?：/, '')
+  return s
 }
 // @提及解析：匹配成员的 seat / label（含 pc1 前缀）；@everyone/@all/全体 → 全员
 function parseOsMentions(text, members) {
@@ -4204,6 +4216,8 @@ function buildOsTurnPrompt(room, member, newMsgs) {
 }
 
 // ── PC2 成员会话管理（懒创建隐藏房间会话，复用 office 的 requestForBot 路由）──
+// 网关双 id 语义：session.create 返回 {session_id: 运行时 id, stored_session_id: 持久 key}；
+// session.resume 只认 stored key（拿运行时 id 去 resume 必吃 4007）。房间记录里只存 stored。
 async function ensureOsSession(member, roomId) {
   const room = getRoom(roomId)
   const existing = room && room.sessions && room.sessions[member.key]
@@ -4213,13 +4227,14 @@ async function ensureOsSession(member, roomId) {
       if (r && (r.runtime || r.session_id || r.id)) return { stored: existing, runtime: r.runtime || r.session_id || r.id }
     } catch (e) { /* 失效：标题兜底 */ }
     // 标题兜底：ws_orphan_reap 后 stored id 失效，但会话实体常仍在——按标题找回
+    // （必须 include_hidden：房间会话全是 hidden:true 创建，缺参列表永远查不到 → 每轮误重建）
     try {
-      const lst = await requestForBot(member, 'session.list', { limit: 50 })
+      const lst = await requestForBot(member, 'session.list', { limit: 50, include_hidden: true })
       const rows = (lst && (lst.sessions || lst.rows || lst.items)) || []
       const want = 'OS-Group: ' + roomId
       const hit = rows.find(x => x && String(x.title || '').includes(want))
       if (hit) {
-        const sid = hit.session_id || hit.id || (hit.session && hit.session.id)
+        const sid = hit.stored_session_id || hit.session_id || hit.id || (hit.session && hit.session.id)
         if (sid) {
           const rr = await requestForBot(member, 'session.resume', { session_id: sid }).catch(() => null)
           patchRoom(roomId, r => { r.sessions[member.key] = sid; return r })
@@ -4232,13 +4247,28 @@ async function ensureOsSession(member, roomId) {
   const created = await requestForBot(member, 'session.create', {
     profile: member.name, title: 'OS-Group: ' + roomId, hidden: true, room_plumbing: true, follow_profile_config: true,
   })
-  const sid = created && (created.session_id || created.id || (created.session && created.session.id))
-  patchRoom(roomId, r => { r.sessions[member.key] = sid; return r })
-  return { stored: sid, runtime: (created && created.runtime) || sid }
+  const runtimeId = created && (created.session_id || created.id || (created.session && created.session.id))
+  const storedId = (created && (created.stored_session_id || created.stored_id)) || runtimeId
+  patchRoom(roomId, r => { r.sessions[member.key] = storedId; return r })
+  return { stored: storedId, runtime: (created && created.runtime) || runtimeId }
 }
 
-// ── 等成员发言完成：message.complete 事件 + resume 轮询兜底 ──
-const osTurnWaiters = new Map() // sessionKey -> {resolve, baseline, memberKey, roomId}
+// ── 等成员发言完成：事件快路径 + resume 轮询兜底 ──
+// waiter 必须在 prompt.submit 之前注册（同步完成帧也丢不了）；双键匹配（runtime + stored，事件帧带哪个都能中）。
+// 网关终态失败发的是裸 error 帧（不是 message.error）；message.complete 也可能载 payload.status==='error'——都算显式失败。
+const osTurnWaiters = new Map() // runtimeId -> {key, sids:[runtime,stored], resolve}
+function osNewWaiter(sessionIds) {
+  const key = String(sessionIds.runtime)
+  let resolveFn = null
+  const promise = new Promise(res => { resolveFn = res })
+  const waiter = {
+    key,
+    sids: [sessionIds.runtime, sessionIds.stored].filter(Boolean).map(String),
+    resolve: (res) => { osTurnWaiters.delete(key); resolveFn(res) },
+  }
+  osTurnWaiters.set(key, waiter)
+  return { waiter, promise }
+}
 function osHandleGatewayEvent(ev) {
   if (!ev || !ev.type) return
   // ws_orphan_reap：网关回收孤儿会话并重配 id——命中我们的成员会话时立即清记录（下次发言自动重建）
@@ -4263,36 +4293,51 @@ function osHandleGatewayEvent(ev) {
     } catch { /* 尽力 */ }
     return
   }
-  if (ev.type !== 'message.complete' && ev.type !== 'message.error') return
-  const sid = ev.session_id || (ev.payload && ev.payload.session_id)
+  if (ev.type !== 'message.complete' && ev.type !== 'message.error' && ev.type !== 'error') return
+  const sid = ev.session_id || (ev.payload && (ev.payload.session_id || ev.payload.stored_session_id))
   if (!sid) return
   if (typeof process !== 'undefined' && process.env && process.env.OSG_DEBUG) {
     console.error('[osHandle]', sid, ev.type, 'waiters=', [...osTurnWaiters.keys()].join(','))
   }
   for (const [key, w] of osTurnWaiters) {
-    if (key === String(sid)) {
-      if (ev.type === 'message.complete') w.resolve({ ok: true, text: (ev.payload && (ev.payload.text || ev.payload.reply)) || '' })
-      else w.resolve({ ok: false, error: (ev.payload && ev.payload.error) || 'message.error' })
+    if ((w.sids ? w.sids.includes(String(sid)) : key === String(sid)) && typeof w.resolve === 'function') {
+      const failed = ev.type !== 'message.complete' || !!(ev.payload && ev.payload.status === 'error')
+      if (!failed) w.resolve({ ok: true, text: (ev.payload && (ev.payload.text || ev.payload.reply)) || '' })
+      else w.resolve({ ok: false, error: (ev.payload && (ev.payload.error || ev.payload.message)) || ev.type })
     }
   }
 }
-async function waitOsTurn(member, roomId, sessionIds, baselineCount) {
-  return new Promise(async (resolve) => {
-    const key = String(sessionIds.runtime)
-    const waiter = { resolve: (res) => { osTurnWaiters.delete(key); finish(res) } }
-    osTurnWaiters.set(key, waiter)
+function osWaitForTurn(member, roomId, sessionIds, baselineCount, waiter, waiterPromise) {
+  return new Promise((resolve) => {
     let done = false
-    const finish = (res) => { if (done) return; done = true; clearInterval(poll); clearTimeout(to); resolve(res) }
+    let resumeFails = 0
+    const finish = (res) => {
+      if (done) return
+      done = true
+      clearInterval(poll); clearTimeout(to)
+      osTurnWaiters.delete(waiter.key)
+      resolve(res)
+    }
+    waiterPromise.then(res => finish(res))   // 事件快路径
     const poll = setInterval(async () => {
       try {
         const r = await requestForBot(member, 'session.resume', { session_id: sessionIds.stored })
+        resumeFails = 0
         const msgs = (r && (r.messages || r.history)) || []
         const fresh = msgs.slice(baselineCount)
         const lastAssistant = [...fresh].reverse().find(m => m && (m.role === 'assistant' || m.kind === 'assistant') && (m.text || m.content))
         if (lastAssistant) finish({ ok: true, text: lastAssistant.text || lastAssistant.content })
-      } catch { /* 继续轮询 */ }
+      } catch (e) {
+        // 不再静默吞错空转：连续 3 次 resume 失败 = 会话实体没了，显式报错（含 session 字样 → 外层自动重建重试一次）
+        resumeFails++
+        if (resumeFails >= 3) finish({ ok: false, error: 'session lost: ' + String(e && e.message || e) })
+      }
     }, OS_RESUME_POLL_MS)
-    const to = setTimeout(() => finish({ ok: false, error: 'timeout' }), OS_TURN_TIMEOUT_MS)
+    const to = setTimeout(() => {
+      // 超时即 interrupt 杀僵尸轮次——不杀的话下一投会撞 busy 排队，连锁超时
+      try { requestForBot(member, 'session.interrupt', { session_id: sessionIds.runtime }).catch(() => null) } catch { /* 尽力 */ }
+      finish({ ok: false, error: 'timeout' })
+    }, OS_TURN_TIMEOUT_MS)
   })
 }
 
@@ -4321,10 +4366,39 @@ async function osMemberSpeak(roomId, member) {
   const attempt = async () => {
     const sess = await ensureOsSession(member, roomId)
     const resume0 = await requestForBot(member, 'session.resume', { session_id: sess.stored }).catch(() => null)
-    const baseline = ((resume0 && (resume0.messages || resume0.history)) || []).length
+    const msgs0 = (resume0 && (resume0.messages || resume0.history)) || []
+    // 迟到回收：上轮失败/超时后晚到的回复先补登入账，并把它纳入 baseline——防止被错认为本轮答案
+    const room0 = getRoom(roomId)
+    const lateMap = (room0 && room0.engine && room0.engine.pendingLate) || null
+    const lateFrom = lateMap && typeof lateMap[member.key] === 'number' ? lateMap[member.key] : null
+    if (lateFrom !== null) {
+      const late = [...msgs0.slice(lateFrom)].reverse().find(m => m && (m.role === 'assistant' || m.kind === 'assistant') && (m.text || m.content))
+      if (late) appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, round: (room0.engine || {}).round || 0,
+        text: '（迟到补登）' + String(late.text || late.content).slice(0, 1200) })
+      patchRoom(roomId, r => { if (r.engine.pendingLate) delete r.engine.pendingLate[member.key]; return r })
+    }
+    const baseline = msgs0.length
+    const { waiter, promise } = osNewWaiter(sess)   // 先注册 waiter，再 submit
     return await withBotLease(member, async () => {
-      await requestForBot(member, 'prompt.submit', { session_id: sess.runtime, text: prompt })
-      const res = await waitOsTurn(member, roomId, sess, baseline)
+      let submitRes
+      try {
+        submitRes = await requestForBot(member, 'prompt.submit', { session_id: sess.runtime, text: prompt })
+        // 排队/改道 = 该会话有僵尸轮次没死透：interrupt 后重投一次；仍排队 → 显式报席位忙碌
+        if (submitRes && (submitRes.status === 'queued' || submitRes.status === 'redirected')) {
+          await requestForBot(member, 'session.interrupt', { session_id: sess.runtime }).catch(() => null)
+          submitRes = await requestForBot(member, 'prompt.submit', { session_id: sess.runtime, text: prompt })
+          if (submitRes && (submitRes.status === 'queued' || submitRes.status === 'redirected')) {
+            osTurnWaiters.delete(waiter.key)
+            return { ok: false, error: '席位忙碌（排队未消化）' }
+          }
+        }
+      } catch (e) {
+        osTurnWaiters.delete(waiter.key)
+        throw e
+      }
+      const res = await osWaitForTurn(member, roomId, sess, baseline, waiter, promise)
+      // 失败时记下基线——下轮先 drain 迟到回复再投新 prompt（防 stale 错认）
+      if (!res.ok) patchRoom(roomId, r => { r.engine.pendingLate = { ...(r.engine.pendingLate || {}), [member.key]: baseline }; return r })
       return res.ok ? { ok: true, text: String(res.text || '').slice(0, 1200) } : { ok: false, error: res.error || 'no reply' }
     })
   }
@@ -4381,9 +4455,9 @@ async function runOsRounds(roomId, opts) {
         room = getRoom(roomId)
         return room && room.engine && room.engine.running && (room.engine.epoch || 0) === epoch
       }
-      const consume = async (member) => {
-        const res = await osMemberSpeak(roomId, member)
-        patchRoom(roomId, r => { r.watermarks[member.key] = (r.log || []).length; return r })
+      // 入账：watermark 仅在发言成功时推进（失败不推进 → 下一轮自动重发该批消息，不盲续）
+      const postResult = (member, res) => {
+        if (res.ok) patchRoom(roomId, r => { r.watermarks[member.key] = (r.log || []).length; return r })
         if (res.ok && !isOsPass(res.text)) {
           appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, text: res.text, round })
           anySpokeThisEpoch = true
@@ -4399,15 +4473,20 @@ async function runOsRounds(roomId, opts) {
         // 定向：按 @mention 出现顺序串行（后发言者能看到先发言者的本轮立场，路由依赖场景）
         for (const member of responders) {
           if (!guard()) break
-          spokeInRound += await consume(member)
+          spokeInRound += postResult(member, await osMemberSpeak(roomId, member))
         }
       } else {
-        // 全员：并行发起、完成即入账（流畅性：一轮 = 最慢席位而非各席之和）
-        const results = await Promise.all(responders.map(async member => {
-          if (!guard()) return 0
-          return consume(member)
-        }))
-        spokeInRound = results.reduce((a, b) => a + b, 0)
+        // 全员：chunk 并行执行、组内乱序完成后按成员序入账
+        // （流畅性：一轮 ≈ ⌈n/3⌉ × 单席时长而非各席之和；顺序性：log 发言顺序恒等于成员序）
+        for (let i = 0; i < responders.length; i += OS_PARALLEL_CHUNK) {
+          if (!guard()) break
+          const chunk = responders.slice(i, i + OS_PARALLEL_CHUNK)
+          const results = await Promise.all(chunk.map(m => osMemberSpeak(roomId, m).then(res => ({ member: m, res }))))
+          for (const { member, res } of results) {
+            if (!guard()) break
+            spokeInRound += postResult(member, res)
+          }
+        }
       }
       if (spokeInRound === 0) break  // 全员 pass → 提前 settled
     }
@@ -4429,12 +4508,13 @@ function appendOsLog(roomId, msg) {
 }
 
 // ── 创建 / 发送 ──
-function createOsRoom({ name, members, maxRounds }) {
+function createOsRoom({ name, members, maxRounds, source }) {
   const room = {
     roomId: mintOsRoomId(), name: name || '合议 ' + new Date().toLocaleDateString('zh-CN'),
-    members: members.slice(0, OS_MAX_MEMBERS), maxRounds: Math.max(1, Math.min(maxRounds || OS_DEFAULT_ROUNDS, OS_MAX_ROUNDS_LIMIT)),
+    members: osSortMembers(members.slice(0, OS_MAX_MEMBERS)), maxRounds: Math.max(1, Math.min(maxRounds || OS_DEFAULT_ROUNDS, OS_MAX_ROUNDS_LIMIT)),
     mode: 'ASK',
-    log: [], watermarks: {}, sessions: {}, engine: { epoch: 0, running: false, settled: false, round: 0, currentSeat: null },
+    source: source || { kind: 'manual' },   // 来源可溯：{kind:'proposal'|'workorder'|'manual', id}——房间从哪来的一眼可见
+    log: [], watermarks: {}, sessions: {}, engine: { epoch: 0, running: false, settled: false, round: 0, currentSeat: null, pendingLate: {} },
     createdAt: Date.now(), lastActiveAt: Date.now(),
   }
   $osRooms.set([...(($osRooms.get() || [])), room])
@@ -4468,6 +4548,7 @@ function addOsRoomMembers(roomId, newMembers) {
       r.watermarks[m.key] = 0 // 新成员从现有历史接入（协议 prompt 只带最近 24 行上下文）
       added++
     }
+    r.members = osSortMembers(r.members)   // 保持发言顺序约束（评审前置、CEO 压轴）
     return r
   })
   return { added }
@@ -4495,9 +4576,12 @@ function osConcludeToProposal(roomId) {
   const room = getRoom(roomId)
   if (!room) return null
   const memberMsgs = (room.log || []).filter(m => m.from.kind === 'member' && !m.sys)
-  const summary = memberMsgs.slice(-8).map(m => `@${m.from.seat}: ${m.text}`).join('\n')
+  // 结论源优先 CEO 终裁（与归档审查包口径一致），无 CEO 发言则前 8 条摘要兜底
+  const ceoFinal = [...memberMsgs].reverse().find(m => m.from.seat === 'ceo')
+  const digest = memberMsgs.slice(-8).map(m => `@${m.from.seat}: ${m.text}`).join('\n')
+  const summary = ceoFinal ? '【CEO 终裁】' + ceoFinal.text + '\n\n【合议摘要】\n' + digest : digest
   return {
-    title: '合议结论：' + room.name,
+    title: '合议结论：' + stripOsTitlePrefix(room.name),
     targetAnchor: '合议群 ' + room.roomId,
     proposerSeat: 'ceo',
     priority: 'P2',
@@ -4505,15 +4589,78 @@ function osConcludeToProposal(roomId) {
   }
 }
 
+// 来源去重：同一提案/工单已有合议群 → 跳转不新建（防「合议：合议结论：…」嵌套房）
+function osFindRoomBySource(kind, id) {
+  if (!id) return null
+  return ($osRooms.get() || []).find(r => r.source && r.source.kind === kind && r.source.id === id) || null
+}
+
+// 登记结论为提案（幂等核心，UI 按钮调它）：房间级幂等 + 服务端去重双保险；失败明示原因
+async function osRegisterConclusion(roomId) {
+  const room = getRoom(roomId)
+  if (!room) return { ok: false, error: 'room gone' }
+  if (room.proposalId) return { ok: true, id: room.proposalId, existed: true }   // 本房间已登记过
+  // 服务端去重：旧版可能已为本房间建过提案（targetAnchor 匹配即认领，不重复登记）
+  const list = await fetch(API + '/api/ledger/proposals').then(r => r.json()).catch(() => null)
+  const rows = Array.isArray(list) ? list : ((list && (list.proposals || list.rows)) || [])
+  const dup = rows.find(p => p && p.targetAnchor === '合议群 ' + roomId && p.currentStage !== '已废止')
+  if (dup) {
+    patchRoom(roomId, rm => { rm.proposalId = dup.proposalId; return rm })
+    appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+      text: '✅ 本房间的结论提案已存在（' + dup.proposalId + '），已自动关联，不重复登记。下一步见下方指引。' })
+    return { ok: true, id: dup.proposalId, existed: true }
+  }
+  const payload = osConcludeToProposal(roomId)
+  if (!payload) return { ok: false, error: 'room gone' }
+  const r = await fetch(API + '/api/action/proposal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).then(r => r.json()).catch(() => null)
+  if (!r || !r.ok) return { ok: false, error: (r && r.error) || '快照服务不可达（8901）' }
+  patchRoom(roomId, rm => { rm.proposalId = r.id; return rm })
+  appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+    text: '✅ 结论已登记为提案 ' + r.id + '。下一步：① 下方「去悬决面板」查看/推进；② 「派单给 CEO 执行」由 CEO 拆解为席位工单下达。' })
+  return { ok: true, id: r.id }
+}
+
+// 派单给 CEO（幂等）：建 1 张「拆解执行」工单 + 直通送达 CEO 会话（指挥链：执行单经 CEO 下达，不越级直派席位）
+async function osDispatchToCeo(roomId) {
+  const room = getRoom(roomId)
+  if (!room) return { ok: false, error: 'room gone' }
+  if (!room.proposalId) return { ok: false, error: '请先登记结论为提案' }
+  if (room.workOrderId) return { ok: true, id: room.workOrderId, existed: true }
+  const payload = osConcludeToProposal(roomId)
+  const wo = await fetch(API + '/api/action/workorder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+    title: '拆解执行：' + stripOsTitlePrefix(room.name),
+    assignedSeat: 'ceo',
+    priority: 'P1',
+    source: '提案 ' + room.proposalId + '（合议群 ' + roomId + '）',
+    operator: '峰哥',
+  }) }).then(r => r.json()).catch(() => null)
+  if (!wo || !wo.ok) return { ok: false, error: (wo && wo.error) || '快照服务不可达（8901）' }
+  patchRoom(roomId, rm => { rm.workOrderId = wo.id; return rm })
+  try {
+    await osDeliverToSeat('ceo', '[AMM OPC 工单 ' + wo.id + ' · 合议执行拆解]\n提案：' + room.proposalId + '（' + payload.title + '）\n\n合议结论：\n' + payload.fiveItems + '\n\n【你的任务】按合议结论拆解为各席位工单并逐一送达（指挥链：执行单经你下达）。回执一行：「已受理」或「缺件：<缺什么>」。')
+  } catch { /* 送达失败不阻塞「工单已建」事实，任务面板可补送 */ }
+  appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+    text: '📮 已派单给 CEO：工单 ' + wo.id + '（拆解执行）已送达 CEO 会话。后续到指挥台 · 任务面板跟踪。' })
+  return { ok: true, id: wo.id }
+}
+
 // 从提案/工单一键发起合议（悬决面板/任务面板「发起合议」按钮调用）
-// 成员默认总经办 8 席（SEATS），议题=事项内容，切到群聊视图并启动轮转
+// 成员默认总经办 8 席（评审判据前置、CEO 压轴），议题=事项内容，切到群聊视图并启动轮转
 function osStartRoomFromProposal(p) {
+  const srcId = p.proposalId || p.workOrderId || null
+  const kind = p.proposalId ? 'proposal' : 'workorder'
+  const dup = osFindRoomBySource(kind, srcId)
+  if (dup) {
+    try { $osActiveRoom.set(dup.roomId); $view.set('chat') } catch { /* 视图切换失败不阻塞 */ }
+    try { host.notify && host.notify('该事项已有合议群「' + dup.name + '」，已为你跳转（不重复建群）') } catch {}
+    return dup
+  }
   const members = SEATS.map(s => ({ key: 'pc2:' + s, name: s, seat: s, label: s, machine: 'pc2' }))
-  const title = p.title || p['事项'] || p.proposalId || p.workOrderId || '未命名事项'
+  const title = stripOsTitlePrefix(p.title || p['事项'] || p.proposalId || p.workOrderId || '未命名事项')
   const anchor = p.targetAnchor || p['出处文件'] || ''
-  const room = createOsRoom({ name: '合议：' + title, members, maxRounds: OS_DEFAULT_ROUNDS })
+  const room = createOsRoom({ name: '合议：' + title, members, maxRounds: OS_DEFAULT_ROUNDS, source: srcId ? { kind, id: srcId } : { kind: 'manual' } })
   appendOsLog(room.roomId, { from: { kind: 'user', seat: 'boss', label: '峰哥' }, text: '【合议议题】' + title + (anchor ? '\n依据/目标锚：' + anchor : '') + '\n请各位从职责视角给出裁决建议（无补充可回 (pass)）。' })
-  try { $view.set('chat') } catch { /* 视图切换失败不阻塞合议 */ }
+  try { $osActiveRoom.set(room.roomId); $view.set('chat') } catch { /* 视图切换失败不阻塞合议 */ }
   runOsRounds(room.roomId)
   return room
 }
@@ -4905,9 +5052,11 @@ function OsGrillPanel({ grill }) {
   ] })
 }
 
+const $osActiveRoom = atom(null)   // 当前激活房间（全局 atom：来源去重跳转/外部深链要能定位到具体房间）
 function OsGroupChat() {
   const rooms = useValue($osRooms) || []
-  const [activeId, setActiveId] = useState(null)
+  const activeId = useValue($osActiveRoom)
+  const setActiveId = v => $osActiveRoom.set(v)
   const [showCreate, setShowCreate] = useState(false)
   const active = rooms.find(r => r.roomId === activeId) || null
 
@@ -4945,6 +5094,8 @@ function OsRoomView({ room, onDeleted }) {
   const [dlg, setDlg] = useState(null)
   const [confirmDel, setConfirmDel] = useState(false)
   const [archiving, setArchiving] = useState(false)
+  const [concluding, setConcluding] = useState(false)
+  const [dispatching, setDispatching] = useState(false)
   const grill = useValue($grill)
   const grillActive = !!(grill && grill.ctxKey === 'room:' + room.roomId)
   const listRef = useRef(null)
@@ -4967,10 +5118,15 @@ function OsRoomView({ room, onDeleted }) {
     sendOsUserMessage(room.roomId, t)
   }
   const conclude = async () => {
-    const payload = osConcludeToProposal(room.roomId)
-    if (!payload) return
-    await fetch(API + '/api/action/proposal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).then(r => r.json()).catch(() => null)
-    try { host.notify && host.notify('已把合议结论登记为提案') } catch {}
+    if (room.proposalId) {   // 幂等：已登记过 → 不再建提案，直接带路去悬决面板
+      try { $deckTab.set('pending'); $view.set('deck') } catch {}
+      return
+    }
+    setConcluding(true)
+    const r = await osRegisterConclusion(room.roomId)
+    setConcluding(false)
+    if (!r.ok) { try { host.notifyError && host.notifyError('登记失败：' + r.error) } catch {}; return }
+    try { host.notify && host.notify(r.existed ? '已关联既有提案 ' + r.id : '已登记为提案 ' + r.id) } catch {}
   }
 
   return jsxs('div', { className: 'osg-room', children: [
@@ -4980,6 +5136,7 @@ function OsRoomView({ room, onDeleted }) {
         jsxs('div', { className: 'osg-room-sub', children: [
           room.members.map(m => m.label).join(' · '),
           '　｜　轮次上限 ' + (room.maxRounds || OS_DEFAULT_ROUNDS),
+          room.source && room.source.kind && room.source.kind !== 'manual' ? '　｜　来源：' + (room.source.kind === 'proposal' ? '提案 ' : '工单 ') + room.source.id : '',
         ] }),
       ] }),
       jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
@@ -4990,7 +5147,10 @@ function OsRoomView({ room, onDeleted }) {
         eng.running ? jsxs('button', { className: 'aod-btn aod-btn-danger', onClick: () => stopOsRounds(room.roomId), children: ['停止'] }) : null,
         eng.settled && !eng.running ? jsxs(Fragment, { children: [
           jsxs('button', { className: 'aod-btn', onClick: () => runOsRounds(room.roomId, { extraRounds: 3 }), children: ['+3 轮续场'] }),
-          jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: conclude, children: ['登记结论为提案'] }),
+          jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: concluding,
+            title: room.proposalId ? '已登记（提案 ' + room.proposalId + '），点击去悬决面板' : '把合议结论写入悬决台账（生成提案号，幂等不重复）',
+            onClick: conclude,
+            children: [concluding ? '登记中…' : room.proposalId ? '已登记 ' + room.proposalId + ' →' : '登记结论为提案'] }),
           jsx('button', { className: 'aod-btn', disabled: archiving, title: '落台账 + 写 PC1 纪要文件 + 通知全部成员', onClick: async () => { setArchiving(true); const r = await archiveOsDeliberation(room.roomId); setArchiving(false); if (r && r.error) { try { host.notifyError && host.notifyError('归档失败：' + r.error) } catch {} } }, children: [archiving ? '归档中…' : '归档纪要'] }),
         ] }) : null,
         jsxs('button', { className: 'aod-btn', title: '重命名群聊', onClick: () => setDlg('rename'), children: ['✏️'] }),
@@ -5003,6 +5163,18 @@ function OsRoomView({ room, onDeleted }) {
     dlg === 'add' ? jsx(OsAddMembersDialog, { room, onClose: () => setDlg(null) }) : null,
     eng.running ? jsxs('div', { className: 'osg-progress', children: [
       '正在合议：第 ' + ((eng.round || 0) + 1) + ' 轮' + (eng.currentSeat ? ' · @' + eng.currentSeat + ' 发言中…' : ''),
+    ] }) : null,
+    eng.settled && !eng.running && room.proposalId ? jsxs('div', { className: 'osg-next', children: [
+      jsxs('div', { className: 'osg-next-t', children: ['✅ 下一步：提案 ' + room.proposalId + (room.workOrderId ? ' ｜ 工单 ' + room.workOrderId : '')] }),
+      jsxs('div', { className: 'osg-next-d', children: ['合议已落定、结论已入悬决台账。① 去悬决面板推进提案阶段；② 派单给 CEO——建一张「拆解执行」工单并送达 CEO 会话，由 CEO 拆解为席位工单下达（指挥链：执行经 CEO）。'] }),
+      jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
+        jsxs('button', { className: 'aod-btn', onClick: () => { try { $deckTab.set('pending'); $view.set('deck') } catch {} }, children: ['去悬决面板'] }),
+        room.workOrderId
+          ? jsxs('button', { className: 'aod-btn', onClick: () => { try { $deckTab.set('tasks'); $view.set('deck') } catch {} }, children: ['已派单 ' + room.workOrderId + ' →'] })
+          : jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: dispatching,
+              onClick: async () => { setDispatching(true); const r = await osDispatchToCeo(room.roomId); setDispatching(false); if (!r.ok) { try { host.notifyError && host.notifyError('派单失败：' + r.error) } catch {} } },
+              children: [dispatching ? '派单中…' : '派单给 CEO 执行'] }),
+      ] }),
     ] }) : null,
     jsxs('div', { className: 'osg-log', ref: listRef, children: [
       log.length === 0 ? jsxs('div', { className: 'osg-empty', children: ['在下方输入议题，@席位可定向点名（如 @ceo @beta）。'] }) : null,
@@ -5213,6 +5385,9 @@ const OS_SHELL_CSS = `
 .osg-assist-item.on{background:rgba(88,166,255,.18)}
 .osg-assist-main{font-weight:600;white-space:nowrap}
 .osg-assist-desc{opacity:.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.osg-next{margin:8px 14px;padding:10px 14px;border:1px solid rgba(63,185,80,.45);border-radius:8px;background:rgba(63,185,80,.07)}
+.osg-next-t{font-weight:700;font-size:12.5px;margin-bottom:4px}
+.osg-next-d{font-size:12px;opacity:.75;margin-bottom:8px;line-height:1.6}
 `
 function injectOsShellCss() {
   let el = document.getElementById('amm-os-shell-css')
@@ -5300,7 +5475,7 @@ const CSS = `
 .aod-drawer-body{padding:14px 16px 30px}
 .aod-kv{display:flex;gap:10px;padding:6px 0;border-bottom:1px dashed rgba(128,128,128,.15);font-size:12.5px}
 .aod-kv-k{width:92px;flex:none;opacity:.6}
-.aod-kv-v{flex:1;word-break:break-all}
+.aod-kv-v{flex:1;word-break:break-all;white-space:pre-wrap}
 .aod-form{margin-top:14px;border-top:1px solid rgba(128,128,128,.25);padding-top:12px}
 .aod-form-title{font-weight:600;margin-bottom:10px;font-size:13px}
 .aod-field{display:block;margin-bottom:10px}
@@ -5619,6 +5794,7 @@ function PendingPanel() {
 function ProposalDrawer({ p, busy, msg, run, onDone, onClose }) {
   const idx = PROPOSAL_STAGES.indexOf(p.currentStage)
   const next = idx >= 0 && idx < PROPOSAL_STAGES.length - 1 ? PROPOSAL_STAGES[idx + 1] : null
+  const [confirmCollab, setConfirmCollab] = useState(false)
   return el(Drawer, {
     title: p.title,
     subtitle: p.proposalId + ' · ' + (p.currentStage || ''),
@@ -5632,6 +5808,7 @@ function ProposalDrawer({ p, busy, msg, run, onDone, onClose }) {
       ['截止日', fmtD(p.deadline)],
       ['创建于', fmtDT(p.createdAt)],
       ['更新于', fmtDT(p.updatedAt)],
+      ...(p.fiveItems ? [['合议结论摘要', p.fiveItems]] : []),
     ],
     children: el(Fragment, { children: [
       next ? el('div', { className: 'aod-btnrow', children: [
@@ -5641,7 +5818,9 @@ function ProposalDrawer({ p, busy, msg, run, onDone, onClose }) {
         el(Btn, { kind: 'danger', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: p.proposalId, newStage: '已废止' }, onDone), children: ['废止提案'] }),
       ] }) : null,
       el('div', { className: 'aod-btnrow', children: [
-        el(Btn, { onClick: () => { try { osStartRoomFromProposal(p); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['发起合议（8 席）'] }),
+        confirmCollab
+          ? el(Btn, { kind: 'pri', onClick: () => { setConfirmCollab(false); try { osStartRoomFromProposal(p); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['确认发起？将创建 8 席合议群并自动开始（已有合议群则跳转不重建）'] })
+          : el(Btn, { title: '从本提案创建 8 席合议群并自动开始合议（同一提案不重复建群）', onClick: () => setConfirmCollab(true), children: ['发起合议（8 席）'] }),
       ] }),
       el(Msg, { msg: msg }),
     ] }),
@@ -5854,6 +6033,7 @@ function TaskPanel() {
 
 function KanbanDetailDrawer({ t, busy, msg, run, onDone, onClose }) {
   const isPaperclip = t._source === 'paperclip'
+  const [confirmCollab, setConfirmCollab] = useState(false)
   return el(Drawer, {
     title: t.title || t.workOrderId,
     subtitle: t.workOrderId + ' · ' + (t.paperclipStatus || t.status || ''),
@@ -5885,7 +6065,9 @@ function KanbanDetailDrawer({ t, busy, msg, run, onDone, onClose }) {
       el('div', { className: 'aod-btnrow', children: [
         !isPaperclip && String(t.assignedSeat || '').startsWith('pc1') ? el(Btn, { kind: 'pri', disabled: busy, onClick: () => run('/api/action/dispatch-pc1', { workOrderId: t.workOrderId }, onDone), children: ['跨机派发到 PC1'] }) : null,
         !isPaperclip && !String(t.assignedSeat || '').startsWith('pc1') ? el(Btn, { kind: 'pri', onClick: () => { deliverWorkorder(t).then(ok => { if (ok) onDone() }) }, children: ['送达到席位会话'] }) : null,
-        el(Btn, { onClick: () => { try { osStartRoomFromProposal(t); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['发起合议（8 席）'] }),
+        confirmCollab
+          ? el(Btn, { kind: 'pri', onClick: () => { setConfirmCollab(false); try { osStartRoomFromProposal(t); onClose() } catch (err) { try { host.notifyError && host.notifyError('合议启动失败：' + (err && err.message || err)) } catch {} } }, children: ['确认发起？将创建 8 席合议群并自动开始（已有合议群则跳转不重建）'] })
+          : el(Btn, { title: '从本工单创建 8 席合议群并自动开始合议（同一工单不重复建群）', onClick: () => setConfirmCollab(true), children: ['发起合议（8 席）'] }),
       ] }),
     ] }),
   })
@@ -6538,15 +6720,18 @@ const PANELS = {
   search: SearchPanel,
 }
 
+// 指挥台当前面板（全局 atom：群聊引导卡等外部入口可深链到指定面板，如 $deckTab.set('pending')）
+const $deckTab = atom('pending')
+
 function DeskHome() {
-  const [tab, setTab] = useState('pending')
+  const tab = useValue($deckTab)
   const P = PANELS[tab] || PendingPanel
   return el('div', { className: 'aod-page', children: [
     el('div', { key: 'tabs', className: 'aod-tabs', children:
       TABS.map(t => el('button', {
         key: t.id,
         className: 'aod-tab' + (t.id === tab ? ' on' : ''),
-        onClick: () => setTab(t.id),
+        onClick: () => $deckTab.set(t.id),
         children: [t.label],
       })) }),
     el(P, { key: 'panel-' + tab }),
@@ -7460,6 +7645,7 @@ export default plugin
 export const __test = {
   DeskHome, PendingPanel, TaskPanel,
   $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
+  $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
