@@ -4108,8 +4108,8 @@ const OS_DEFAULT_ROUNDS = 6
 const OS_MAX_ROUNDS_LIMIT = 12
 const OS_LOG_LIMIT = 200          // 每房滚动 retention
 const OS_HISTORY_LINES = 24       // 注入协议时携带的新消息上限
-const OS_TURN_TIMEOUT_MS = 300000 // 成员发言超时（长输出任务如执行清单可达数分钟）
-const OS_DIRECTED_TIMEOUT_MS = 600000 // @点名定向轮超时（指名任务=终裁/执行清单，大上下文长输出给双倍预算；09-20 CEO 终裁 297s 被掐实证）
+const OS_TURN_TIMEOUT_MS = 600000 // 成员发言超时（09-20 controller 全员轮 300s 被掐实证后统一提到 600s；仍不够由 osMemberSpeak 的一次自动重试吸收）
+const OS_DIRECTED_TIMEOUT_MS = 600000 // @点名定向轮超时（指名任务=终裁/执行清单，大上下文长输出；CEO 终裁 297s 被掐实证）
 const OS_RESUME_POLL_MS = 5000
 const OS_PARALLEL_CHUNK = 3       // 全员并行限流（防 8 席冷启动风暴）；组内乱序完成、按成员序入账
 
@@ -4129,8 +4129,37 @@ function loadOsRooms(ctx) {
           setTimeout(() => { try { runOsRounds(r.roomId) } catch {} }, 3000)
         }
       }
+      // 台账为唯一真值源（CEO 终裁原则）：加载时从服务端 hydrate 房间标记——
+      // 外部经办（Zcode 收口）登记的提案/归档/工单，插件重载后 UI 即刻对齐，零点击同步
+      setTimeout(() => { osHydrateRoomMarks().catch(() => {}) }, 1500)
     }
   } catch { /* no storage */ }
+}
+async function osHydrateRoomMarks() {
+  const [props, dels, wos] = await Promise.all([
+    fetch(API + '/api/ledger/proposals').then(r => r.json()).catch(() => null),
+    fetch(API + '/api/ledger/deliberations').then(r => r.json()).catch(() => null),
+    fetch(API + '/api/ledger/workorders').then(r => r.json()).catch(() => null),
+  ])
+  const propRows = Array.isArray(props) ? props : []
+  const delRows = Array.isArray(dels) ? dels : []
+  const woRows = Array.isArray(wos) ? wos : []
+  for (const r of $osRooms.get() || []) {
+    const patch = {}
+    if (!r.proposalId) {
+      const p = propRows.find(x => x && x.targetAnchor === '合议群 ' + r.roomId && x.currentStage !== '已废止')
+      if (p) patch.proposalId = p.proposalId
+    }
+    if (!r.archivedId) {
+      const d = delRows.find(x => x && x.roomId === r.roomId)
+      if (d) patch.archivedId = d.deliberationId
+    }
+    if (!r.workOrderId) {
+      const w = woRows.find(x => x && String(x.source || '').includes(r.roomId) && String(x.assignedSeat || '') === 'ceo')
+      if (w) patch.workOrderId = w.workOrderId
+    }
+    if (Object.keys(patch).length) patchRoom(r.roomId, x => Object.assign(x, patch))
+  }
 }
 function saveOsRooms() {
   try { osRoomsCtx?.storage?.set?.(OS_ROOMS_KEY, $osRooms.get()) } catch { /* no storage */ }
@@ -4303,6 +4332,22 @@ function osHandleGatewayEvent(ev) {
     } catch { /* 尽力 */ }
     return
   }
+  if (ev.type === 'message.delta') {
+    // 进度可见（真假死一眼可辨）：节流 2s/席，累计已生成字数到 engine.progress
+    const sid = ev.session_id || (ev.payload && ev.payload.session_id)
+    const chunk = (ev.payload && (ev.payload.delta || ev.payload.text)) || ''
+    if (!sid || !chunk) return
+    const now = Date.now()
+    for (const r of $osRooms.get() || []) {
+      const seatKey = Object.keys(r.sessions || {}).find(k => String(r.sessions[k]) === String(sid))
+      if (!seatKey) continue
+      const cur = ((r.engine || {}).progress || {})[seatKey] || { at: 0, chars: 0 }
+      if (now - cur.at < 2000) return
+      patchRoom(r.roomId, x => { x.engine.progress = { ...(x.engine.progress || {}), [seatKey]: { at: now, chars: cur.chars + String(chunk).length } }; return x })
+      return
+    }
+    return
+  }
   if (ev.type !== 'message.complete' && ev.type !== 'message.error' && ev.type !== 'error') return
   const sid = ev.session_id || (ev.payload && (ev.payload.session_id || ev.payload.stored_session_id))
   if (!sid) return
@@ -4415,6 +4460,12 @@ async function osMemberSpeak(roomId, member, opts) {
   }
   try {
     let res = await attempt()
+    // 超时类失败自动重试一次（interrupt 已在超时处理里杀过僵尸轮）——600s 仍不够时由重试吸收网络抖动/偶发慢响应
+    if (!res.ok && /timeout/i.test(res.error || '')) {
+      appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, sys: true,
+        text: '（@' + member.seat + ' 首轮超时，自动重试一次）', round: (getRoom(roomId).engine || {}).round || 0 })
+      res = await attempt()
+    }
     if (!res.ok && /session/i.test(res.error || '')) {
       patchRoom(roomId, r => { delete r.sessions[member.key]; return r }) // 会话失效：清记录强制重建
       appendOsLog(roomId, { from: { kind: 'member', seat: member.seat, label: member.label }, sys: true,
@@ -4800,6 +4851,7 @@ async function osNudgeDispatch(roomId, opts) {
 async function archiveOsDeliberation(roomId) {
   const room = getRoom(roomId)
   if (!room) return { error: 'room gone' }
+  if (room.archivedId) return { ok: true, id: room.archivedId, existed: true }   // 幂等：重复点击/重复落定包不产生重复 DEL
   const userFirst = (room.log || []).find(m => m.from.kind === 'user')
   const entries = (room.log || []).filter(m => m.from.kind === 'member' && !m.sys).map(m => ({ seat: m.from.seat, text: m.text }))
   const participants = [...new Set(entries.map(e => e.seat))]
@@ -4809,6 +4861,7 @@ async function archiveOsDeliberation(roomId) {
   }).then(r => r.json()).catch(() => null)
   if (!resp || !resp.ok) return { error: (resp && resp.error) || '归档失败' }
   const did = resp.id
+  patchRoom(roomId, r => { r.archivedId = did; return r })   // 幂等标记：后续重复调用直接返回
   // markdown 纪要 → 写 PC1 工作目录（执行层上下文文件）
   const md = ['# 合议纪要 ' + did, '', '- 议题：' + payload.topic, '- 时间：' + new Date().toISOString().slice(0, 16).replace('T', ' '),
     '- 参与：' + (participants.join(', ') || '（无成员发言）'), '', '## 发言记录',
@@ -5271,7 +5324,7 @@ function OsRoomView({ room, onDeleted }) {
             title: room.proposalId ? '已登记（提案 ' + room.proposalId + '），点击打开执行追踪' : '把合议结论写入悬决台账（生成提案号，幂等不重复）',
             onClick: conclude,
             children: [concluding ? '登记中…' : room.proposalId ? '已登记 ' + room.proposalId + ' →' : '登记结论为提案'] }),
-          jsx('button', { className: 'aod-btn', disabled: archiving, title: '落台账 + 写 PC1 纪要文件 + 通知全部成员', onClick: async () => { setArchiving(true); const r = await archiveOsDeliberation(room.roomId); setArchiving(false); if (r && r.error) { try { host.notifyError && host.notifyError('归档失败：' + r.error) } catch {} } }, children: [archiving ? '归档中…' : '归档纪要'] }),
+          jsx('button', { className: 'aod-btn', disabled: archiving, title: room.archivedId ? '已归档 ' + room.archivedId + '（幂等，不重复归档）' : '落台账 + 写 PC1 纪要文件 + 通知全部成员', onClick: async () => { setArchiving(true); const r = await archiveOsDeliberation(room.roomId); setArchiving(false); if (r && r.error) { try { host.notifyError && host.notifyError('归档失败：' + r.error) } catch {} } }, children: [archiving ? '归档中…' : room.archivedId ? '已归档 ' + room.archivedId : '归档纪要'] }),
         ] }) : null,
         jsxs('button', { className: 'aod-btn', title: '重命名群聊', onClick: () => setDlg('rename'), children: ['✏️'] }),
         jsxs('button', { className: 'aod-btn', title: '追加成员', onClick: () => setDlg('add'), children: ['➕'] }),
@@ -5282,7 +5335,8 @@ function OsRoomView({ room, onDeleted }) {
     dlg === 'rename' ? jsx(OsRenameDialog, { room, onClose: () => setDlg(null) }) : null,
     dlg === 'add' ? jsx(OsAddMembersDialog, { room, onClose: () => setDlg(null) }) : null,
     eng.running ? jsxs('div', { className: 'osg-progress', children: [
-      '正在合议：第 ' + ((eng.round || 0) + 1) + ' 轮' + (eng.currentSeat ? ' · @' + eng.currentSeat + ' 发言中…' : ''),
+      '正在合议：第 ' + ((eng.round || 0) + 1) + ' 轮' + (eng.currentSeat ? ' · @' + eng.currentSeat + ' 发言中…' : '')
+      + (eng.currentSeat && eng.progress && eng.progress[eng.currentSeat] ? '（已 ' + eng.progress[eng.currentSeat].chars + ' 字）' : ''),
     ] }) : null,
     eng.settled && !eng.running && room.proposalId ? jsxs('div', { className: 'osg-next', children: [
       jsxs('div', { className: 'osg-next-t', children: ['✅ 下一步：提案 ' + room.proposalId + (room.workOrderId ? ' ｜ 工单 ' + room.workOrderId : '')] }),
@@ -7982,7 +8036,7 @@ export const __test = {
   $osRooms, getRoom, createOsRoom, appendOsLog, parseOsMentions, isOsPass, osNewMessages, buildOsTurnPrompt, archiveOsDeliberation, runOsRounds, stopOsRounds, osConcludeToProposal, osStartRoomFromProposal, loadOsRooms, sendOsUserMessage, OsGroupChat, renameOsRoom, addOsRoomMembers, deleteOsRoom, osGrillStart, osGrillSubmit, osGrillBrief, osGrillClose, $grill, ensureOsSession, osMemberSpeak, buildOsTurnPrompt, archiveOsDeliberation, osAssistOnChange, osAssistOnKey, osAssistPick, osAssistClose, $assist, $osAttach, OS_SLASH_COMMANDS,
   $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
   $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
-  importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS,
+  importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS, OS_TURN_TIMEOUT_MS, osHydrateRoomMarks,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
