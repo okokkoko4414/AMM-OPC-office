@@ -6405,7 +6405,7 @@ function TaskPanel() {
             (w.title || '').slice(0, 34) + ((w.title || '').length > 34 ? '…' : ''),
             w.assignedSeat || '—',
             el(Tag, { tone: priorityTone(w.priority), children: [w.priority || '—'] }),
-            el(Tag, { tone: /待验收|已交付/.test(w.status + (w.lastReply || '')) ? 'warn' : w.status === '进行中' && !w.lastReply ? 'err' : w.status === '进行中' ? 'info' : (/终止|升级|废止/.test(String(w.status || '')) ? 'err' : 'ok'), children: [/已交付/.test(String(w.lastReply || '')) && w.status === '进行中' ? '待验收' : w.status === '进行中' && !w.lastReply ? '已派单·待回执' : (w.status || '—')] }),
+            el(Tag, { tone: woTag(w).tone, children: [woTag(w).label] }),
             w.lastReply ? String(w.lastReply).slice(0, 26) : '—',
           ],
         })),
@@ -7191,6 +7191,21 @@ function matterChain(p, workorders) {
   const isDone = w => /完成|交付|闭环|已销/.test(String((w && w.status) || ''))
   return { main, subs, subsDone: subs.filter(isDone).length }
 }
+// 工单状态标签（D1 真值：status×lastReply×lastEvent 三源合看；纯函数可测）
+// 有 progress 事件无回执＝「执行中·有事件」，不再误报「已派单·待回执」
+function woTag(w) {
+  const s = String((w && w.status) || '')
+  const lr = String((w && w.lastReply) || '')
+  if (/已交付/.test(lr) && s === '进行中') return { label: '待验收', tone: 'warn' }
+  if (s === '进行中' && !lr) {
+    return (w && w.lastEvent)
+      ? { label: '执行中·有事件（回执对账中）', tone: 'info' }
+      : { label: '已派单·待回执', tone: 'err' }
+  }
+  const tone = /待验收/.test(s) ? 'warn' : /终止|升级|废止/.test(s) ? 'err' : s === '进行中' ? 'info' : 'ok'
+  return { label: s || '—', tone }
+}
+
 // 工单真值（D1 状态推导＝按台账真值）：status/lastReply/lastEvent 决定态，不再假设
 function woTruth(w) {
   const s = String((w && w.status) || '')
@@ -7272,6 +7287,7 @@ function MatterFocusPanel() {
   const nextStage = p && stageIdx >= 0 && stageIdx < PROPOSAL_STAGES.length - 1 ? PROPOSAL_STAGES[stageIdx + 1] : null
 
   const steps = focusSteps(p, chain, Array.isArray(accs.data) ? accs.data : [])
+  const mainRepOpen = chain.main ? (Array.isArray(accs.data) ? accs.data : []).find(a => a && a.workOrderId === chain.main.workOrderId && a.status === '未终签') : null
 
   return el('div', { children: [
     el('div', { className: 'aod-head', children: [
@@ -7281,6 +7297,7 @@ function MatterFocusPanel() {
       ] }),
       el('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
         roomId ? el(Btn, { onClick: () => { try { $osActiveRoom.set(roomId); $view.set('chat') } catch {} }, children: ['回·合议群'] }) : null,
+        el(Btn, { onClick: () => { try { $matterFocus.set(null) } catch {} }, children: ['← 全部事项'] }),
       ] }),
     ] }),
 
@@ -7311,7 +7328,7 @@ function MatterFocusPanel() {
             w.workOrderId + (w.pc1Ref ? '\n' + w.pc1Ref : ''),
             (w.title || '').slice(0, 30),
             String(w.assignedSeat || '—') + (w.lane === 'pc1-dev' ? ' →PC1' : w.lane === 'zcode' ? ' →Zcode' : ''),
-            el(Tag, { tone: /待验收|已交付/.test(w.status + (w.lastReply || '')) ? 'warn' : w.status === '进行中' && !w.lastReply ? 'err' : w.status === '进行中' ? 'info' : (/终止|升级/.test(String(w.status || '')) ? 'err' : 'ok'), children: [/已交付/.test(String(w.lastReply || '')) && w.status === '进行中' ? '待验收' : w.status === '进行中' && !w.lastReply ? '已派单·待回执' : (w.status || '—')] }),
+            el(Tag, { tone: woTag(w).tone, children: [woTag(w).label] }),
             fmtD(w.deadline),
             w.lastReply ? String(w.lastReply).slice(0, 28) : '—',
           ],
@@ -7325,8 +7342,9 @@ function MatterFocusPanel() {
         // 待 QA 终签（D2）：quality-auditor 按验收清单终签，通过→已完成 / 退回→执行中
         // 注意：el() 会给对象 child 补 key（{...c,key}），嵌套数组会被展开成 {0:..,1:..,key} 对象 → React #31。必须先展开再作 child
         ...(act.kind === 'accept' && chain.main && chain.main.status === '待验收' ? [
-          el(Btn, { key: 'acc', kind: 'pri', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'accept', operator: 'quality-auditor', detail: 'QA 终签通过（验收清单核验）' }, () => { allP.refresh(); wos.refresh() }), children: ['QA 验收通过→已完成'] }),
-          el(Btn, { key: 'rej', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'progress', operator: 'quality-auditor', detail: 'QA 退回：验收清单未过，返工' }, () => { allP.refresh(); wos.refresh() }), children: ['退回返工'] }),
+          el('div', { className: 'aod-note', key: 'qanote', children: ['QA 自动终签进行中' + (mainRepOpen ? '（报告 ' + mainRepOpen.reportId + '）' : '') + '；下方为人工抽检兜底，签了立即生效。'] }),
+          el(Btn, { key: 'acc', kind: 'pri', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'accept', operator: '峰哥', detail: '人工抽检终签通过（验收清单核验）' }, () => { allP.refresh(); wos.refresh() }), children: ['人工终签：通过→已完成'] }),
+          el(Btn, { key: 'rej', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'progress', operator: '峰哥', detail: '人工抽检终签退回：返工' }, () => { allP.refresh(); wos.refresh() }), children: ['人工终签：退回返工'] }),
         ] : []),
         act.kind === 'accept' && chain.main && chain.main.status !== '待验收' ? el(Btn, { key: 'cls', kind: 'pri', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: focus.proposalId, newStage: '已裁定' }, () => allP.refresh()), children: ['验收并闭环'] }) : null,
         // 催办仅在真超时（无回执且派出超 60 分钟）——D1：不再对已交付单显示催办
@@ -8305,7 +8323,7 @@ export const __test = {
   $osActiveRoom, osRegisterConclusion, osDispatchToCeo, osFindRoomBySource, osSortMembers, stripOsTitlePrefix, $deckTab,
   $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
   importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS, OS_TURN_TIMEOUT_MS, osHydrateRoomMarks, osOnSettled, osSettleFallbackChain,
-  osParseWorkorders, osDeliverVerified, osReconcileDispatches, osPc1Gate, focusSteps, woTruth,
+  osParseWorkorders, osDeliverVerified, osReconcileDispatches, osPc1Gate, focusSteps, woTruth, woTag,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
