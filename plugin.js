@@ -4144,8 +4144,12 @@ function loadOsRooms(ctx) {
       // 台账为唯一真值源（CEO 终裁原则）：加载时从服务端 hydrate 房间标记——
       // 外部经办（Zcode 收口）登记的提案/归档/工单，插件重载后 UI 即刻对齐，零点击同步
       setTimeout(() => { osHydrateRoomMarks().catch(() => {}) }, 1500)
-      // 对账器：加载后 8s 跑一次（修三源分裂——「送达未确认」假阴性自动补正）
+      // 对账器：加载后 8s 首跑（修三源分裂——「送达未确认」假阴性自动补正）＋5 分钟常驻节拍（晚回执不必等重载）
       setTimeout(() => { osReconcileDispatches().catch(() => {}) }, 8000)
+      if (!globalThis.__osReconcileTimer) {
+        globalThis.__osReconcileTimer = setInterval(() => { osReconcileDispatches().catch(() => {}) }, 300000)
+        if (globalThis.__osReconcileTimer.unref) globalThis.__osReconcileTimer.unref()
+      }
     }
   } catch { /* no storage */ }
 }
@@ -5042,7 +5046,9 @@ async function osPc1Gate(wid) {
     body: JSON.stringify({ workOrderId: wid, operator: 'os-desk', fields: { planText: plan.reply || '' } }) }).then(r => r.json()).catch(() => null)
   const review = await osDeliverAndAwait('independent-reviewer',
     '[PC1 开发计划审查 ' + wid + ']\n计划（PC1 回执原文）：\n' + (plan.reply || '') + '\n\n判据：目标对齐／验收清单可测／风险清单。只回「放行」或「hold：理由」。', 120000)
-  const verdict = (review && review.ok ? review.reply : '') || ''
+  // 评审未回执≠hold（同款 120s 假阴性教训）：超时明示「非 hold」，可重发审查
+  if (!review || !review.ok) return { ok: false, error: '评审超时未回执（非 hold）——' + ((review && review.error) || '可重发审查') }
+  const verdict = review.reply || ''
   if (/放行/.test(verdict) && !/hold/i.test(verdict)) {
     await fetch(API + '/api/action/workorder-update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ workOrderId: wid, operator: 'independent-reviewer', fields: { reviewRelease: '放行' } }) }).then(r => r.json()).catch(() => null)
@@ -6517,6 +6523,13 @@ function KanbanDetailDrawer({ t, busy, msg, run, onDone, onClose }) {
 // ══════════════════════════════════════════════════════════
 // 面板 3：验收清单
 // ══════════════════════════════════════════════════════════
+// 滞留时长（验收报告 createdAt 起算，未终签时显示）
+function stuckHours(createdAt) {
+  const t = Date.parse(String(createdAt || '').replace(' ', 'T'))
+  if (!isFinite(t)) return '—'
+  return ((Date.now() - t) / 3600000).toFixed(1) + 'h'
+}
+
 function AcceptancePanel() {
   const { data, loading, error, refresh } = useFetch(API + '/api/ledger/acceptances')
   const { busy, msg, run } = useAction()
@@ -6537,17 +6550,20 @@ function AcceptancePanel() {
     ] }),
     el(Card, { title: '验收报告（点击行 → 通过 / 退回）', children: [
       el(Tbl, {
-        cols: ['报告号', '工单/事项', '验收人', '证据分级', '结论'],
-        empty: '暂无验收报告 —— 工单完工后由 quality-auditor 签发',
+        cols: ['报告号', '工单/事项', '验收人', '证据分级', '滞留', '结论'],
+        empty: '暂无验收报告 —— receipt 事件即时触发 QA 终签（秒级），失败由秘书每 30 分钟兜底重试',
         items: all.map(a => ({
           key: a.reportId,
           onClick: () => setSel(a),
           cells: [
             a.reportId,
-            a.title || a.workOrderId || '—',
+            a.target || a.title || a.workOrderId || '—',
             a.auditor || 'quality-auditor',
-            el(Tag, { tone: a.evidenceGrade === 'A' ? 'ok' : 'warn', children: [a.evidenceGrade || '—'] }),
-            a.verdict ? el(Tag, { tone: a.verdict === '通过' ? 'ok' : 'err', children: [a.verdict] }) : el(Tag, { tone: 'info', children: ['待结论'] }),
+            el(Tag, { tone: String(a.evidenceGrade || '').indexOf('A') === 0 ? 'ok' : 'warn', children: [a.evidenceGrade || '—'] }),
+            a.status === '未终签' ? stuckHours(a.createdAt) : '—',
+            a.verdict && a.verdict !== '待核验'
+              ? el(Tag, { tone: a.verdict === '通过' ? 'ok' : 'err', children: [a.verdict] })
+              : el(Tag, { tone: 'info', children: ['待核验'] }),
           ],
         })),
       }),
@@ -6564,14 +6580,15 @@ function AcceptanceDrawer({ a, busy, msg, run, onDone, onClose }) {
     fields: [
       ['报告号', a.reportId],
       ['工单号', a.workOrderId],
-      ['事项', a.title],
+      ['事项', a.target || a.title],
       ['验收人', a.auditor],
       ['证据分级', a.evidenceGrade],
       ['证据说明', a.evidenceNote],
-      ['当前结论', a.verdict || '待结论'],
+      ['QA 投递', a.qaDispatchedAt ? (a.qaDispatchOk ? '已投递 · ' + a.qaDispatchedAt : '投递失败（秘书兜底重试中）') : '待投递'],
+      ['当前结论', a.verdict || '待核验'],
       ['重做指令', a.reworkInstructions],
     ],
-    children: a.verdict ? null : el(Fragment, { children: [
+    children: (a.verdict && a.verdict !== '待核验') ? null : el(Fragment, { children: [
       el(ActionForm, {
         title: '验收结论',
         fields: [
@@ -7217,6 +7234,7 @@ function MatterFocusPanel() {
   const focus = useValue($matterFocus)
   const allP = useFetch(API + '/api/ledger/proposals', 10000)
   const wos = useFetch(API + '/api/ledger/workorders', 10000)
+  const accs = useFetch(API + '/api/ledger/acceptances', 10000)
   const { busy, msg, run } = useAction()
   const [nudging, setNudging] = useState(false)
 
@@ -7253,7 +7271,7 @@ function MatterFocusPanel() {
   const stageIdx = p ? PROPOSAL_STAGES.indexOf(p.currentStage) : -1
   const nextStage = p && stageIdx >= 0 && stageIdx < PROPOSAL_STAGES.length - 1 ? PROPOSAL_STAGES[stageIdx + 1] : null
 
-  const steps = focusSteps(p, chain)
+  const steps = focusSteps(p, chain, Array.isArray(accs.data) ? accs.data : [])
 
   return el('div', { children: [
     el('div', { className: 'aod-head', children: [
@@ -7321,25 +7339,35 @@ function MatterFocusPanel() {
 }
 
 // 链路条构建（纯函数，可测）：提案登记→转录派发→席位执行（无子单直通验收 D3）→验收闭环
-function focusSteps(p, chain) {
+// accRows＝验收报告行（可选）：有则显示报告号与 QA 结论
+function focusSteps(p, chain, accRows) {
   const t = chain.main ? woTruth(chain.main) : { st: 'none' }
+  const accRows_ = Array.isArray(accRows) ? accRows : []
+  const mainId = chain.main ? chain.main.workOrderId : null
+  const repOpen = mainId ? accRows_.find(a => a && a.workOrderId === mainId && a.status === '未终签') : null
+  const repDone = mainId ? accRows_.find(a => a && a.workOrderId === mainId && a.status === '已终签') : null
   return [
-    p ? { label: '提案登记', state: 'done', note: p.proposalId + ' · ' + p.currentStage } : { label: '提案登记', state: 'pending', note: '' },
+    p ? { label: '提案登记', state: 'done', note: p.proposalId + ' · ' + p.currentStage } : { label: '提案登记', state: 'pending', note: '未到达 · 前置：合议落定' },
     chain.main
       ? { label: '转录派发', state: (chain.main.lastReply && !/送达未确认/.test(String(chain.main.lastReply))) || t.st === 'accept' ? 'done' : 'doing',
           note: t.st === 'accept' ? '已交付·等 QA 终签'
             : (chain.main.lastReply && !/送达未确认/.test(String(chain.main.lastReply))
               ? '回执：' + String(chain.main.lastReply).slice(0, 36)
               : fmtDT(chain.main.createdAt) + ' 派出 · 等回执' + stuckMinutes(chain.main.createdAt)) }
-      : { label: '转录派发', state: 'pending', note: '' },
+      : { label: '转录派发', state: 'pending', note: '未到达 · 前置：提案登记' },
     chain.subs.length
       ? { label: '席位执行', state: chain.subsDone === chain.subs.length ? 'done' : 'doing', note: chain.subsDone + '/' + chain.subs.length + ' 子单完成（含 PC1）' }
       : (t.st === 'accept' || t.st === 'done')
         ? { label: '席位执行', state: 'done', note: '无子单 · 直通验收（D3）' }
-        : { label: '席位执行', state: 'pending', note: '' },
+        : chain.main
+          ? { label: '席位执行', state: 'doing', note: '无子单 · 主单在途（拆解/执行）' }
+          : { label: '席位执行', state: 'pending', note: '未到达 · 前置：转录派发' },
     (chain.subs.length && chain.subsDone === chain.subs.length) || t.st === 'accept' || t.st === 'done'
-      ? { label: '验收闭环', state: chain.main && chain.main.status === '待验收' ? 'doing' : 'done', note: chain.main && chain.main.status === '待验收' ? '待 QA 终签' : '可闭环' }
-      : { label: '验收闭环', state: 'pending', note: '' },
+      ? { label: '验收闭环', state: chain.main && chain.main.status === '待验收' ? 'doing' : 'done',
+          note: chain.main && chain.main.status === '待验收'
+            ? (repOpen ? '报告 ' + repOpen.reportId + ' · 待 QA 终签' : '待 QA 终签')
+            : (repDone ? '报告 ' + repDone.reportId + ' · QA ' + (repDone.verdict || '通过') : '可闭环') }
+      : { label: '验收闭环', state: 'pending', note: '未到达 · 前置：席位执行完成' },
   ]
 }
 
