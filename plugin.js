@@ -5756,7 +5756,7 @@ function el(type, props) {
   let { key, children, ...rest } = props
   if (Array.isArray(children)) {
     children = children.map((c, i) =>
-      c && typeof c === 'object' && c.key == null ? { ...c, key: '@k' + i } : c)
+      c && !Array.isArray(c) && typeof c === 'object' && c.key == null ? { ...c, key: '@k' + i } : c)
   }
   const p = children === undefined ? rest : { ...rest, children }
   return key !== undefined ? jsx(type, p, key) : jsx(type, p)
@@ -7277,10 +7277,11 @@ function MatterFocusPanel() {
       el('div', { className: 'aod-note', children: ['当前状态：' + act.label] }),
       el('div', { className: 'aod-btnrow', children: [
         // 待 QA 终签（D2）：quality-auditor 按验收清单终签，通过→已完成 / 退回→执行中
-        act.kind === 'accept' && chain.main && chain.main.status === '待验收' ? [
-          el(Btn, { kind: 'pri', key: 'acc', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'accept', operator: 'quality-auditor', detail: 'QA 终签通过（验收清单核验）' }, () => { allP.refresh(); wos.refresh() }), children: ['QA 验收通过→已完成'] }),
+        // 注意：el() 会给对象 child 补 key（{...c,key}），嵌套数组会被展开成 {0:..,1:..,key} 对象 → React #31。必须先展开再作 child
+        ...(act.kind === 'accept' && chain.main && chain.main.status === '待验收' ? [
+          el(Btn, { key: 'acc', kind: 'pri', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'accept', operator: 'quality-auditor', detail: 'QA 终签通过（验收清单核验）' }, () => { allP.refresh(); wos.refresh() }), children: ['QA 验收通过→已完成'] }),
           el(Btn, { key: 'rej', disabled: busy, onClick: () => run('/api/action/workorder-event', { workOrderId: chain.main.workOrderId, event: 'progress', operator: 'quality-auditor', detail: 'QA 退回：验收清单未过，返工' }, () => { allP.refresh(); wos.refresh() }), children: ['退回返工'] }),
-        ] : null,
+        ] : []),
         act.kind === 'accept' && chain.main && chain.main.status !== '待验收' ? el(Btn, { key: 'cls', kind: 'pri', disabled: busy, onClick: () => run('/api/action/update-stage', { proposalId: focus.proposalId, newStage: '已裁定' }, () => allP.refresh()), children: ['验收并闭环'] }) : null,
         // 催办仅在真超时（无回执且派出超 60 分钟）——D1：不再对已交付单显示催办
         act.kind === 'await' && chain.main && stuckMinutes(chain.main.createdAt) ? el(Btn, { kind: 'pri', disabled: nudging, onClick: async () => { setNudging(true); const r = await focusNudge(focus, chain); setNudging(false); try { host.notify && host.notify(r.ok ? '催办已送达，席位已回执' : '催办未确认：' + (r.error || '')) } catch {} }, children: [nudging ? '催办中…' : '催办重发（等回执）'] }) : null,
