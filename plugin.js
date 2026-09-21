@@ -4137,7 +4137,7 @@ function loadOsRooms(ctx) {
         // 已落定但收口不全（缺登记/归档/派单任一标记，含跨重启）→ 补跑收口链（幂等，零人工）
         if (r.engine && r.engine.settled) {
           const hasFinal = (r.log || []).some(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
-          const incomplete = !r.proposalId || !r.archivedId || (!r.workOrderId && hasFinal && !(r.dispatch && r.dispatch.error))
+          const incomplete = !r.proposalId || !r.archivedId || (!r.workOrderId && hasFinal)
           if (incomplete) setTimeout(() => { osSettleFallbackChain(r.roomId).catch(() => {}) }, 6000 + i * 500)
         }
       }
@@ -4771,7 +4771,7 @@ async function osDispatchToCeo(roomId, opts) {
   let delivery
   try { delivery = await deliverFn('ceo', text) } catch (e) { delivery = { ok: false, error: String(e && e.message || e) } }
   if (delivery && delivery.ok) {
-    patchRoom(roomId, rm => { rm.dispatch = { workOrderId: wo.id, at: Date.now(), delivered: true, pendingAck: true, receipt: null }; return rm })
+    patchRoom(roomId, rm => { rm.dispatch = { workOrderId: wo.id, at: Date.now(), delivered: true, pendingAck: true, receipt: null, marker: text.slice(0, 40) }; return rm })
     try {
       await fetch(API + '/api/action/workorder-event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workOrderId: wo.id, event: 'deliver', operator: 'os-desk', detail: '派单送达 CEO 会话（实证）' }) }).then(r => r.json()).catch(() => null)
@@ -4894,6 +4894,8 @@ function osParseWorkorders(text) {
 function osOnSettled(roomId) {
   const room = getRoom(roomId)
   if (!room) return
+  if (room.settlePackSent) return   // 幂等：崩溃恢复/重复落定不重复投包（秘书已持线头）
+  patchRoom(roomId, rm => { rm.settlePackSent = true; return rm })
   // 落定包投秘书（智能转录主路径）：含终裁机读块与 schema 闸校验结果
   try {
     const ceoFinals = (room.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
@@ -4902,7 +4904,7 @@ function osOnSettled(roomId) {
     const pack = '[落定包 · ' + room.name + ']\nroomId=' + roomId + '\n提案标记=' + (room.proposalId || '（待登记）') +
       '\n\nCEO 终裁（末条全文）：\n' + (finalText || '（无终裁——请先追 CEO 补终裁再登记，勿登记空结论）') +
       '\n\n【转录指令（secretary-ops）】' + (parsed.ok
-        ? '终裁含 workorders 机读块（' + parsed.orders.length + ' 条，schema 合格）。照块转录登记工单并逐 lane 派发：pc2-seat→deliverWorkorder+deliver事件；zcode→落 orders/（Zcode 巡检领取）；pc1-dev→两段式（先开发计划送审→independent-reviewer 放行→dispatch-pc1 开工）。'
+        ? '终裁含 workorders 机读块（' + parsed.orders.length + ' 条，schema 合格）。照块转录登记工单并逐 lane 派发：pc2-seat→deliverWorkorder+deliver事件；zcode→orders/（Zcode 巡检领取）；pc1-dev→两段式（先开发计划送审→independent-reviewer 放行→dispatch-pc1 开工）。'
         : '终裁缺机读块或不合规（' + parsed.error + '）——回 CEO 补 ```workorders``` 机读块（六字段 task/seat/eta/acceptance/checklist/lane），不硬解自由文本。') +
       '\n30 分钟内未动作由兜底链补位（幂等，永不双跑）。'
     osDeliverToSeat('amm-secretary', pack).catch(() => {})
@@ -4918,51 +4920,76 @@ async function osSettleFallbackChain(roomId) {
     const r = await osRegisterConclusion(roomId).catch(() => null)
     if (r && r.ok) done.push('登记 ' + r.id)
   }
-  const room2 = getRoom(roomId)
-  if (room2 && !room2.archivedId) {
+  const rmArch = getRoom(roomId)
+  if (rmArch && !rmArch.archivedId) {
     const a = await archiveOsDeliberation(roomId).catch(() => null)
     if (a && a.ok) done.push('归档 ' + a.id)
   }
-  // 兜底派发＝「转录代办」单给秘书（不派 CEO——CEO 终裁已含拆解，转录非裁决）
-  const room3 = getRoom(roomId)
-  const ceoFinals = (room3.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
-  if (room3 && !room3.transcribeWO && !(room3.dispatch && room3.dispatch.pendingAck)) {
-    if (ceoFinals.length) {
-      const finalText = ceoFinals[ceoFinals.length - 1].text
-      const parsed = osParseWorkorders(finalText)
-      if (parsed.ok) {
-        const wo = await fetch(API + '/api/action/workorder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-          title: '转录代办：' + room.name, assignedSeat: 'amm-secretary', priority: 'P1',
-          source: '提案 ' + (room3.proposalId || '?') + '（合议群 ' + roomId + '）', operator: '兜底链',
-        }) }).then(r => r.json()).catch(() => null)
-        if (wo && wo.ok) {
-          patchRoom(roomId, rm => { rm.transcribeWO = wo.id; rm.transcribeRetries = 0; return rm })
-          const text = '[AMM OPC 转录代办单 ' + wo.id + ']\n提案：' + (room3.proposalId || '?') + '\n\n终裁机读块（schema 合格，照块转录）：\n```workorders\n' + finalText.match(/```workorders\s*\n([\s\S]*?)```/)[1].trim() + '\n```\n\n逐 lane 派发：pc2-seat→deliverWorkorder；zcode→orders/；pc1-dev→两段式（计划送审→放行→开工）。回执一行：「已受理」+ 工单清单。'
-          try { await osDeliverToSeat('amm-secretary', text) } catch { /* 尽力 */ }
-          try { await fetch(API + '/api/action/workorder-event', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workOrderId: wo.id, event: 'deliver', operator: '兜底链', detail: '转录代办单送秘书' }) }).then(r => r.json()).catch(() => null) } catch {}
-          done.push('转录代办 ' + wo.id)
-          // CEO 闭会信息件（无需动作，回复「重开」触发复判）
-          try { osDeliverToSeat('ceo', '[闭会通报 · ' + room.name + '] DEC ' + (room3.proposalId || '?') + ' 已收口，转录代办单 ' + wo.id + ' 已派秘书（无需动作；回复「重开」触发复判）。').catch(() => {}) } catch {}
-        } else {
-          patchRoom(roomId, rm => { rm.dispatch = { workOrderId: null, at: Date.now(), receipt: null, error: (wo && wo.error) || '建单失败' }; return rm })
-        }
-      } else {
-        appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
-          text: '终裁机读块不合规（' + parsed.error + '）——已追 CEO 补件（```workorders``` 六字段），补齐后自动转录。' })
-      }
-    } else if (!(room3.log || []).some(m => m.sys && /派单待 CEO 终裁后自动执行/.test(m.text))) {
-      appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
-        text: '已登记/已归档完成；派单待 CEO 终裁后自动执行（无需人工操作）。' })
+  // 转录/派发：机读块 schema 合格 → 兜底链可确定性转录（秘书是智能主路径，本链是其保险）
+  const rmFinal = getRoom(roomId)
+  const ceoFinals = (rmFinal.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
+  const finalText = ceoFinals.length ? ceoFinals[ceoFinals.length - 1].text : ''
+  const parsed = osParseWorkorders(finalText)
+  const alreadySubs = ((rmArch.proposalId &&
+    (await fetch(API + '/api/ledger/workorders').then(r => r.json()).catch(() => []))
+      .filter(w => String(w.source || '').includes(rmArch.proposalId)).length) || 0)
+  let registered = []
+  if (parsed.ok && !alreadySubs) {
+    // 确定性转录：照机读块逐条登记（六字段齐，schema 闸已过），按 lane 路由
+    for (const o of parsed.orders) {
+      const wo = await fetch(API + '/api/action/workorder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        title: String(o.task).slice(0, 80), assignedSeat: o.seat, priority: 'P1',
+        deadline: o.eta || null, source: '提案 ' + rmArch.proposalId + ' 拆解（合议群 ' + roomId + '）',
+        acceptance: o.acceptance, checklist: JSON.stringify(o.checklist || []), lane: o.lane, operator: '收口链',
+      }) }).then(r => r.json()).catch(() => null)
+      if (wo && wo.ok) registered.push({ wid: wo.id, lane: o.lane, seat: o.seat })
     }
+    if (registered.length) {
+      patchRoom(roomId, rm => { rm.workOrderId = registered[0].wid; rm.subsRegistered = registered.length; return rm })
+      done.push('转录 ' + registered.length + ' 单')
+      // 逐 lane 派发
+      for (const w of registered) {
+        try {
+          if (w.lane === 'pc1-dev') {
+            const g = await osPc1Gate(w.wid)
+            appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+              text: g.ok ? 'PC1 单 ' + w.wid + ' 已放行开工（GEOAA ' + (g.pc1Ref || '锚点待回）') : 'PC1 单 ' + w.wid + ' ' + (g.error || '送审失败') })
+          } else {
+            const dv = await osDeliverVerified(w.seat, '[AMM OPC 工单 ' + w.wid + '] ' + w.seat)
+            await fetch(API + '/api/action/workorder-event', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workOrderId: w.wid, event: dv.ok ? 'deliver' : 'progress', operator: '收口链', detail: dv.ok ? '已送达 ' + w.seat : dv.error }) }).then(r => r.json()).catch(() => null)
+          }
+        } catch { /* 单张失败不阻塞其余 */ }
+      }
+      // CEO 闭会信息件（无需动作）
+      try { osDeliverToSeat('ceo', '[闭会通报 · ' + room.name + '] ' + (rmArch.proposalId || '?') + ' 已收口：转录 ' + registered.length + ' 单已登记派发（无需动作；回复「重开」触发复判）。').catch(() => {}) } catch {}
+    } else if (!registered.length && parsed.ok) {
+      patchRoom(roomId, rm => { rm.dispatch = { workOrderId: null, at: Date.now(), error: '转录建单失败' }; return rm })
+    }
+  } else if (!parsed.ok) {
+    // schema 闸拒收 → 无终裁先等终裁；有终裁但块不合规 → 回 CEO 补件（CEO 是补件 owner）＋系统行（一次）
+    if (!ceoFinals.length) {
+      if (!(rmFinal.log || []).some(m => m.sys && /待 CEO 终裁后自动转录派发/.test(m.text))) {
+        appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+          text: '已登记/已归档完成；待 CEO 终裁——终裁到达后的下一轮落定将自动转录派发（无需人工操作）。' })
+      }
+    } else if (!(rmFinal.log || []).some(m => m.sys && /机读块不合规/.test(m.text))) {
+      appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+        text: '终裁机读块不合规（' + parsed.error + '）——已请 CEO 补件，补齐后自动转录派发（无需人工操作）。' })
+      try { osDeliverToSeat('ceo', '[补件请求 · ' + room.name + '] 终裁缺 ```workorders``` 机读块或不合规（' + parsed.error + '）。请按六字段（task/seat/eta/acceptance/checklist/lane）补发机读块，补齐后自动转录派发。').catch(() => {}) } catch {}
+    }
+  } else if (alreadySubs) {
+    done.push('转录派发确认（' + alreadySubs + ' 张子单已在账）')
   }
-  // 两次失败保守默认：已有转录代办单但秘书仍未转录（transcribeRetries≥1 再触发时）
-  if (room3 && room3.transcribeWO && !room3.transcribeWOAcked) {
-    const retries = (room3.transcribeRetries || 0)
+  // 保守默认：转录两次未完成 → 派单挂起 + CEO 仲裁（授权块纪律：系统不默认等峰哥，CEO 是仲裁席非签核位）
+  const rmRetry = getRoom(roomId)
+  if (rmRetry && parsed && parsed.ok && !alreadySubs && registered && registered.length === 0) {
+    const retries = (rmRetry.closeoutRetries || 0)
     if (retries >= 1) {
       patchRoom(roomId, rm => { rm.dispatchPending = true; return rm })
-      try { osDeliverToSeat('ceo', '[仲裁请示 · ' + room.name + '] 转录代办单 ' + room3.transcribeWO + ' 两次未转录。按保守默认：仅登记/归档，派单挂起。回复「重开」或人工指派转录人。').catch(() => {}) } catch {}
+      try { osDeliverToSeat('ceo', '[仲裁请示 · ' + room.name + '] 收口链两轮未完成转录派发。按保守默认：仅登记/归档，派单挂起。回复「重开」触发复判或指派转录人。').catch(() => {}) } catch {}
     } else {
-      patchRoom(roomId, rm => { rm.transcribeRetries = retries + 1; return rm })
+      patchRoom(roomId, rm => { rm.closeoutRetries = retries + 1; return rm })
+      setTimeout(() => { osSettleFallbackChain(roomId) }, OS_SETTLE_FALLBACK_MS)   // 30 分钟后第二轮
     }
   }
   if (done.length) {
@@ -4985,10 +5012,13 @@ async function osReconcileDispatches() {
       if (!chat || !chat.runtime) continue
       const r = await requestForBot({ name: 'ceo' }, 'session.resume', { session_id: chat.runtime }).catch(() => null)
       const msgs = (r && (r.messages || r.history)) || []
-      const hit = [...msgs].reverse().find(m =>
+      // 位置匹配（不依赖 at 字段）：marker 之后的首条 assistant 发言即回执候选；关键词收紧防误记
+      const marker = String(room.dispatch.marker || '')
+      const mi = msgs.findIndex(m => m && (m.role === 'user' || m.kind === 'user') && String(m.text || m.content || '').includes(marker))
+      if (mi < 0) continue
+      const hit = msgs.slice(mi + 1).find(m =>
         m && (m.role === 'assistant' || m.kind === 'assistant') && (m.text || m.content) &&
-        (m.at || 0) >= (room.dispatch.at || 0) - 60000 &&
-        /已受理|拆解|闭环|交割|WO-/.test(String(m.text || m.content)))
+        /已受理|已开工|已交付|拆解完成|闭环/.test(String(m.text || m.content)))
       if (hit) {
         const line = String(hit.text || hit.content).split('\n')[0].slice(0, 120)
         await fetch(API + '/api/action/workorder-event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -5522,9 +5552,7 @@ function OsRoomView({ room, onDeleted }) {
       jsxs('div', { className: 'aod-btnrow', children: [
         jsxs('button', { className: 'aod-btn', onClick: goFocus, title: '仅查看，不触发任何动作：该事项全链路进度（提案→工单→执行→验收）', children: ['查看执行进度'] }),
         room.dispatch && room.dispatch.error && !room.workOrderId
-          ? jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: dispatching,
-              onClick: async () => { setDispatching(true); const r = await osDispatchToCeo(room.roomId); setDispatching(false); if (r && r.ok) { patchRoom(room.roomId, rm => { rm.dispatch = null; return rm }) } else if (r && !r.ok) { try { host.notifyError && host.notifyError('派单失败：' + r.error) } catch {} } },
-              children: [dispatching ? '重试中…' : '重试派单'] })
+          ? jsxs('span', { className: 'osg-next-d', style: { margin: 0, alignSelf: 'center', color: '#d29922' }, children: ['自动派单失败——收口链重载时将自动重试'] })
           : null,
       ] }),
     ] }) : null,
@@ -7164,7 +7192,7 @@ function nextAction(p, chain) {
   const main = chain.main
   if (!main) return { kind: 'transcribe', label: '待转录派发（秘书经办，自动）' }
   const t = woTruth(main)
-  if (t.st === 'noack' && !chain.subs.length) return { kind: 'await', label: '已送达·等回执（自动对账中，无需操作）' }
+  if (t.st === 'noack' && !chain.subs.length) return { kind: 'await', label: '已派单·等回执（自动对账中，无需操作）' }
   if (t.st === 'accept') return { kind: 'accept', label: '已交付·待 QA 终签验收' }
   if (t.st === 'done') return { kind: 'done', label: '已完成' }
   if (chain.subs.length && chain.subsDone < chain.subs.length) return { kind: 'exec', label: '席位执行中（' + chain.subsDone + '/' + chain.subs.length + ' 完成）' }
