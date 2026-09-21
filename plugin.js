@@ -5815,6 +5815,7 @@ const TABS = [
   { id: 'finance', label: '经营' },
   { id: 'ops', label: '运营' },
   { id: 'search', label: '检索' },
+  { id: 'perf', label: '绩效' },
 ]
 
 // ══════════════════════════════════════════════════════════
@@ -7166,6 +7167,131 @@ function SearchPanel() {
 // ══════════════════════════════════════════════════════════
 // 主页面 + 注册
 // ══════════════════════════════════════════════════════════
+// ── 绩效（WO-20260921-009 · 规格 V1.0）：按席位聚合任务数/双列时长/token，只读 ──
+// 时长口径（峰哥定双列）：执行=派出→交付；周期=建单→终签通过；仅已完成单计完成时长；QA 退回单只计退回数
+function parseTs(s) {
+  const t = Date.parse(String(s || '').replace(' ', 'T'))
+  return isFinite(t) ? t : null
+}
+function deliveredTs(w) {
+  if (/已交付/.test(String(w.lastReply || ''))) return parseTs(w.repliedAt) || parseTs(w.lastEventAt)
+  if (w.lastEvent === 'receipt') return parseTs(w.lastEventAt)
+  return null
+}
+function acceptedTs(w, accs) {
+  if (w.status !== '已完成') return null
+  const a = (Array.isArray(accs) ? accs : []).find(x => x && x.workOrderId === w.workOrderId && x.verdict === '通过')
+  return parseTs(a && a.verdictAt) || parseTs(w.lastEventAt)
+}
+const _MIN = 60000
+function perfAggregate(wos, accs, usageRows) {
+  const bySeat = {}
+  for (const w of (Array.isArray(wos) ? wos : [])) {
+    if (!w) continue
+    const seat = String(w.assignedSeat || '—')
+    const s = bySeat[seat] || (bySeat[seat] = { seat, total: 0, done: 0, rejected: 0, exec: [], cycle: [] })
+    s.total++
+    if (w.status === '已完成') s.done++
+    if ((Array.isArray(accs) ? accs : []).some(a => a && a.workOrderId === w.workOrderId && a.verdict === '退回')) s.rejected++
+    const d = deliveredTs(w), aTs = acceptedTs(w, accs)
+    const start = parseTs(w.dispatchedAt) || parseTs(w.createdAt)
+    const created = parseTs(w.createdAt)
+    if (w.status === '已完成' && d && start) s.exec.push((d - start) / _MIN)
+    if (aTs && created) s.cycle.push((aTs - created) / _MIN)
+  }
+  const usage = {}
+  for (const u of (Array.isArray(usageRows) ? usageRows : [])) if (u && u.profile) usage[u.profile] = u
+  return Object.keys(bySeat).map(seat => {
+    const s = bySeat[seat]
+    const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null
+    const u = usage[seat] || null
+    return {
+      seat, total: s.total, done: s.done, rejected: s.rejected,
+      avgExec: avg(s.exec), maxExec: s.exec.length ? Math.max.apply(null, s.exec) : null,
+      avgCycle: avg(s.cycle),
+      tokens: u ? { input: u.input || 0, output: u.output || 0, cacheRead: u.cacheRead || 0 } : null,
+    }
+  }).sort((a, b) => b.total - a.total)
+}
+function fmtDur(mins) {
+  if (mins == null || !isFinite(mins)) return '—'
+  if (mins < 1) return '<1m'
+  if (mins < 60) return Math.round(mins) + 'm'
+  return (mins / 60).toFixed(1) + 'h'
+}
+// 分钟级时间显示（含 Date 时间戳；本地时区）
+function fmtTs(x) {
+  if (x == null) return '—'
+  const d = typeof x === 'number' ? new Date(x) : new Date(String(x).replace(' ', 'T'))
+  if (isNaN(d.getTime())) return '—'
+  const p = n => String(n).padStart(2, '0')
+  return String(d.getFullYear()).slice(2) + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+}
+// 本地席位→profile（token 按 profile 聚合；pc1-*/跨机席位不在本机核心，显示「—」）
+const PERF_PROFILES = ['ceo', 'research-lead', 'strategy-director', 'quality-auditor',
+  'skills-architect', 'workflow-designer', 'controller', 'independent-reviewer',
+  'amm-secretary', 'os-guardian']
+
+// 面板 8：绩效（只读——台账＋桌面核心用量桥，峰哥评估智能体效率）
+function PerfPanel() {
+  const wos = useFetch(API + '/api/ledger/workorders', 10000)
+  const accs = useFetch(API + '/api/ledger/acceptances', 10000)
+  const [usage, setUsage] = useState({ rows: null, degraded: null })
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const bridge = (typeof window !== 'undefined' && window.hermesDesktop) || null
+        if (!bridge || typeof bridge.api !== 'function') throw new Error('桌面桥不可用（旧宿主）')
+        const rows = []
+        for (const p of PERF_PROFILES) {
+          const r = await bridge.api({ path: '/api/analytics/usage?days=30&profile=' + encodeURIComponent(p), timeoutMs: 20000 })
+          const agg = { profile: p, input: 0, output: 0, cacheRead: 0 }
+          const days = (r && Array.isArray(r.daily)) ? r.daily : (Array.isArray(r) ? r : [])
+          for (const d of days) {
+            agg.input += Number(d && (d.input_tokens != null ? d.input_tokens : d.input)) || 0
+            agg.output += Number(d && (d.output_tokens != null ? d.output_tokens : d.output)) || 0
+            agg.cacheRead += Number(d && (d.cache_read_tokens != null ? d.cache_read_tokens : d.cacheRead)) || 0
+          }
+          rows.push(agg)
+        }
+        if (alive) setUsage({ rows, degraded: null })
+      } catch (e) {
+        if (alive) setUsage({ rows: null, degraded: String((e && e.message) || e) })
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+  const rows = perfAggregate(Array.isArray(wos.data) ? wos.data : [], Array.isArray(accs.data) ? accs.data : [], usage.rows)
+  return el('div', { children: [
+    el('div', { className: 'aod-head', children: [
+      el('div', { children: [
+        el('h1', { className: 'aod-h1', children: ['绩效'] }),
+        el('div', { className: 'aod-sub', children: ['按席位聚合 · 执行时长=派出→交付，周期时长=建单→终签通过 · token 与 Ledgerline 同源（近 30 天）' + (usage.degraded ? ' · token 列降级：' + usage.degraded : '')] }),
+      ] }),
+    ] }),
+    el(Card, { title: '席位汇总（10s 刷新 · token 60s）', children: [
+      el(Tbl, {
+        cols: ['席位', '任务数', '完成', '退回', '平均执行', '最长执行', '平均周期', 'token 输入', 'token 输出', 'cache 读'],
+        empty: wos.loading ? '加载中…' : '暂无工单',
+        items: rows.map(r => ({
+          key: r.seat,
+          cells: [
+            r.seat,
+            String(r.total),
+            String(r.done),
+            r.rejected ? el(Tag, { tone: 'err', children: [String(r.rejected)] }) : '0',
+            fmtDur(r.avgExec), fmtDur(r.maxExec), fmtDur(r.avgCycle),
+            r.tokens ? r.tokens.input.toLocaleString() : '—',
+            r.tokens ? r.tokens.output.toLocaleString() : '—',
+            r.tokens ? r.tokens.cacheRead.toLocaleString() : '—',
+          ],
+        })),
+      }),
+    ] }),
+  ] })
+}
+
 const PANELS = {
   focus: MatterFocusPanel,
   pending: PendingPanel,
@@ -7175,6 +7301,7 @@ const PANELS = {
   finance: FinancePanel,
   ops: OpsPanel,
   search: SearchPanel,
+  perf: PerfPanel,
 }
 
 // 指挥台当前面板（全局 atom：群聊引导卡等外部入口可深链到指定面板，如 $deckTab.set('pending')）
@@ -7320,19 +7447,24 @@ function MatterFocusPanel() {
 
     chain.main ? el(Card, { title: '执行工单 ' + chain.main.workOrderId + (chain.subs.length ? '（子单 ' + chain.subsDone + '/' + chain.subs.length + ' 完成）' : ''), children: [
       el(Tbl, {
-        cols: ['工单号', '标题', '派给', '状态', '截止', '最近回执'],
+        cols: ['工单号', '标题', '派给', '状态', '截止', '起止', '最近回执'],
         empty: '—',
-        items: [chain.main, ...chain.subs].map(w => ({
-          key: w.workOrderId,
-          cells: [
-            w.workOrderId + (w.pc1Ref ? '\n' + w.pc1Ref : ''),
-            (w.title || '').slice(0, 30),
-            String(w.assignedSeat || '—') + (w.lane === 'pc1-dev' ? ' →PC1' : w.lane === 'zcode' ? ' →Zcode' : ''),
-            el(Tag, { tone: woTag(w).tone, children: [woTag(w).label] }),
-            fmtD(w.deadline),
-            w.lastReply ? String(w.lastReply).slice(0, 28) : '—',
-          ],
-        })),
+        items: [chain.main, ...chain.subs].map(w => {
+          const accRows = Array.isArray(accs.data) ? accs.data : []
+          const end = acceptedTs(w, accRows) || deliveredTs(w) || (w.lastEventAt ? fmtTs(w.lastEventAt) : '—')
+          return {
+            key: w.workOrderId,
+            cells: [
+              w.workOrderId + (w.pc1Ref ? '\n' + w.pc1Ref : ''),
+              (w.title || '').slice(0, 30),
+              String(w.assignedSeat || '—') + (w.lane === 'pc1-dev' ? ' →PC1' : w.lane === 'zcode' ? ' →Zcode' : ''),
+              el(Tag, { tone: woTag(w).tone, children: [woTag(w).label] }),
+              fmtDT(w.deadline),
+              fmtTs(w.dispatchedAt || w.createdAt) + '\n→ ' + end,
+              w.lastReply ? String(w.lastReply).slice(0, 28) : '—',
+            ],
+          }
+        }),
       }),
     ] }) : null,
 
@@ -8324,6 +8456,7 @@ export const __test = {
   $matterFocus, MatterFocusPanel, matterChain, nextAction, goFocusMatter, osDeliverAndAwait, osAwaitReceipt, osNudgeDispatch,
   importBootstrapRoom, OS_DIRECTED_TIMEOUT_MS, OS_TURN_TIMEOUT_MS, osHydrateRoomMarks, osOnSettled, osSettleFallbackChain,
   osParseWorkorders, osDeliverVerified, osReconcileDispatches, osPc1Gate, focusSteps, woTruth, woTag,
+  perfAggregate, fmtDur, fmtTs,
  AcceptancePanel, CommitmentPanel, FinancePanel, OpsPanel, SearchPanel, ProposalDrawer, EscalationDrawer, CommitmentDrawer, KanbanDetailDrawer, AcceptanceDrawer, RulingsCard, ReconDrawer,
   deskMood,
   displayName,
