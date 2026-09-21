@@ -4134,9 +4134,11 @@ function loadOsRooms(ctx) {
         if (r.engine && r.engine.running && !r.autoResume) {
           setTimeout(() => { try { runOsRounds(r.roomId) } catch {} }, 4000 + i * 500)
         }
-        // 已落定未收口且超过兜底窗（含跨重启）→ 立即补位收口
-        if (r.engine && r.engine.settled && !r.proposalId && r.engine.settledAt && Date.now() - r.engine.settledAt > OS_SETTLE_FALLBACK_MS) {
-          setTimeout(() => { osSettleFallbackChain(r.roomId).catch(() => {}) }, 6000 + i * 500)
+        // 已落定但收口不全（缺登记/归档/派单任一标记，含跨重启）→ 补跑收口链（幂等，零人工）
+        if (r.engine && r.engine.settled) {
+          const hasFinal = (r.log || []).some(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
+          const incomplete = !r.proposalId || !r.archivedId || (!r.workOrderId && hasFinal && !(r.dispatch && r.dispatch.error))
+          if (incomplete) setTimeout(() => { osSettleFallbackChain(r.roomId).catch(() => {}) }, 6000 + i * 500)
         }
       }
       // 台账为唯一真值源（CEO 终裁原则）：加载时从服务端 hydrate 房间标记——
@@ -4728,7 +4730,7 @@ async function osRegisterConclusion(roomId) {
   if (!r || !r.ok) return { ok: false, error: (r && r.error) || '快照服务不可达（8901）' }
   patchRoom(roomId, rm => { rm.proposalId = r.id; return rm })
   appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
-    text: '✅ 结论已登记为提案 ' + r.id + '。下一步：① 下方「去悬决面板」查看/推进；② 「派单给 CEO 执行」由 CEO 拆解为席位工单下达。' })
+    text: '✅ 结论已登记为提案 ' + r.id + '。收口链将自动完成归档与派单（全程无需人工操作）。' })
   return { ok: true, id: r.id }
 }
 
@@ -4873,7 +4875,7 @@ function osOnSettled(roomId) {
   // 落定包投秘书：记录/跟催/反馈主路径（秘书不列席，靠落定包+线头账）
   try {
     const ceoFinals = (room.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
-    const pack = '[落定包 · ' + room.name + ']\nroomId=' + roomId + '\n提案标记=' + (room.proposalId || '（待登记）') + '\n\nCEO 终裁（末条）：\n' + ((ceoFinals[ceoFinals.length - 1] || {}).text || '（无终裁——请先追 CEO 补终裁再登记，勿登记空结论）') + '\n\n请按 secretary-ops 执行：登记提案→归档纪要→（bootstrap 来源房）派单 CEO；30 分钟内未动作由兜底链补位（幂等）。'
+    const pack = '[落定包 · ' + room.name + ']\nroomId=' + roomId + '\n提案标记=' + (room.proposalId || '（待登记）') + '\n\nCEO 终裁（末条）：\n' + ((ceoFinals[ceoFinals.length - 1] || {}).text || '（无终裁——请先追 CEO 补终裁再登记，勿登记空结论）') + '\n\n请按 secretary-ops 执行：登记提案→归档纪要→派单 CEO（存在终裁即派，任何来源房）；30 分钟内未动作由兜底链补位（幂等）。'
     osDeliverToSeat('amm-secretary', pack).catch(() => {})
   } catch { /* 秘书不可达：兜底链照常 */ }
   // 兜底链：30 分钟后检查三标记，缺则补（幂等保证与秘书永不双跑）
@@ -4893,13 +4895,23 @@ async function osSettleFallbackChain(roomId) {
     if (a && a.ok) done.push('归档 ' + a.id)
   }
   const room3 = getRoom(roomId)
-  if (room3 && room3.source && room3.source.kind === 'bootstrap' && !room3.workOrderId) {
-    const w = await osDispatchToCeo(roomId).catch(() => null)
-    if (w && w.ok) done.push('派单 ' + w.id)
+  // 派单闸门＝存在 CEO 终裁发言（任何来源房；协议本就不分房间来源）。无终裁不派单，等终裁后自动收口
+  const ceoFinals = (room3.log || []).filter(m => m.from.kind === 'member' && m.from.seat === 'ceo' && !m.sys)
+  if (room3 && !room3.workOrderId) {
+    if (ceoFinals.length) {
+      const w = await osDispatchToCeo(roomId).catch(() => null)
+      if (w && w.ok) done.push('派单 ' + w.id)
+      else if (w && !w.ok && !w.existed) {
+        patchRoom(roomId, rm => { rm.dispatch = { workOrderId: null, at: Date.now(), receipt: null, error: w.error || '派单失败' }; return rm })
+      }
+    } else if (!(room3.log || []).some(m => m.sys && /派单待 CEO 终裁后自动执行/.test(m.text))) {
+      appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
+        text: '已登记/已归档完成；派单待 CEO 终裁后自动执行（无需人工操作）。' })
+    }
   }
   if (done.length) {
     appendOsLog(roomId, { from: { kind: 'member', seat: 'system', label: '系统' }, sys: true, round: 0,
-      text: ' 收口兜底链补位（秘书 30 分钟未动作）：' + done.join('｜') + '。经办=兜底链（幂等，未与秘书双跑）。' })
+      text: '已自动收口：' + done.join('｜') + '（全程无需人工操作）。经办=收口链（幂等）。' })
   }
 }
 
@@ -5395,15 +5407,17 @@ function OsRoomView({ room, onDeleted }) {
       + (eng.currentSeat && eng.progress && eng.progress[eng.currentSeat] ? '（已 ' + eng.progress[eng.currentSeat].chars + ' 字）' : ''),
     ] }) : null,
     eng.settled && !eng.running && room.proposalId ? jsxs('div', { className: 'osg-next', children: [
-      jsxs('div', { className: 'osg-next-t', children: ['✅ 下一步：提案 ' + room.proposalId + (room.workOrderId ? ' ｜ 工单 ' + room.workOrderId : '')] }),
-      jsxs('div', { className: 'osg-next-d', children: ['合议已落定、结论已入悬决台账。单一入口进「执行追踪」：提案阶段推进、工单回执与席位执行进度、验收闭环全在这一页看全。'] }),
-      jsxs('div', { className: 'aod-btnrow', style: { marginTop: 0 }, children: [
-        jsxs('button', { className: 'aod-btn aod-btn-pri', onClick: goFocus, title: '单一入口：该事项全链路（提案→工单→执行→验收）', children: ['执行追踪'] }),
-        room.workOrderId
-          ? jsxs('span', { className: 'osg-next-d', style: { margin: 0, alignSelf: 'center' }, children: ['已派单 ' + room.workOrderId + '（进度见执行追踪）'] })
-          : jsxs('button', { className: 'aod-btn', disabled: dispatching,
-              onClick: async () => { setDispatching(true); const r = await osDispatchToCeo(room.roomId); setDispatching(false); if (!r.ok) { try { host.notifyError && host.notifyError('派单失败：' + r.error) } catch {} } },
-              children: [dispatching ? '派单中…' : '派单给 CEO 执行'] }),
+      jsxs('div', { className: 'osg-next-t', children: ['✅ 已自动收口（无需你操作）'] }),
+      jsxs('div', { className: 'osg-next-d', children: [
+        '提案 ' + room.proposalId + ' ｜ 纪要 ' + (room.archivedId || '—') + ' ｜ 工单 ' + (room.workOrderId || (room.dispatch && room.dispatch.error ? '自动派单失败：' + room.dispatch.error : '待 CEO 终裁后自动派单')),
+      ] }),
+      jsxs('div', { className: 'aod-btnrow', children: [
+        jsxs('button', { className: 'aod-btn', onClick: goFocus, title: '仅查看，不触发任何动作：该事项全链路进度（提案→工单→执行→验收）', children: ['查看执行进度'] }),
+        room.dispatch && room.dispatch.error && !room.workOrderId
+          ? jsxs('button', { className: 'aod-btn aod-btn-pri', disabled: dispatching,
+              onClick: async () => { setDispatching(true); const r = await osDispatchToCeo(room.roomId); setDispatching(false); if (r && r.ok) { patchRoom(room.roomId, rm => { rm.dispatch = null; return rm }) } else if (r && !r.ok) { try { host.notifyError && host.notifyError('派单失败：' + r.error) } catch {} } },
+              children: [dispatching ? '重试中…' : '重试派单'] })
+          : null,
       ] }),
     ] }) : null,
     jsxs('div', { className: 'osg-log', ref: listRef, children: [
